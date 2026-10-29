@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "lib": ["es2023"],
+    "module": "node20",
+    "target": "es2023",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "types": ["node", "mocha"],
+    "verbatimModuleSyntax": true
+  },
+  "include": ["hardhat.config.ts", "launch.config.ts", "scripts/**/*.ts", "test/**/*.ts", "types/**/*.ts"]
+}

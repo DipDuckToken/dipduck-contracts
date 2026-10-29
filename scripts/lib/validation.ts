@@ -1,0 +1,380 @@
+import { ZeroAddress, getAddress, parseEther } from "ethers";
+
+import { DEAD_ADDRESS, MAX_WHOLE_TOKENS } from "./constants.ts";
+import { LaunchError } from "./errors.ts";
+
+export interface TokenParams {
+  name: string;
+  symbol: string;
+  /** Offre en tokens entiers. */
+  supply: bigint;
+}
+
+export interface LiquidityParams {
+  ethAmount: string;
+  tokenPercent: number;
+}
+
+export interface ValidatedLiquidity {
+  ethAmountWei: bigint;
+  tokenPercent: bigint;
+}
+
+export interface VestingParams {
+  enabled: boolean;
+  /** Durée totale du blocage, en jours. */
+  durationDays: number;
+  /** Falaise : rien n'est libérable avant ce délai, en jours. */
+  cliffDays: number;
+  /** Adresse qui reçoit les tokens libérés ; vide = le wallet de déploiement. */
+  beneficiary: string;
+}
+
+export interface CommunityParams {
+  /** Réserve communauté, en % de l'offre. */
+  percent: number;
+  /** Wallet dédié qui la reçoit. */
+  beneficiary: string;
+}
+
+export interface ValidatedCommunity {
+  percent: bigint;
+  /** Absent quand percent vaut 0. */
+  beneficiary?: string;
+}
+
+export interface ValidatedVesting {
+  enabled: boolean;
+  durationSeconds: bigint;
+  cliffSeconds: bigint;
+  beneficiary: string;
+}
+
+const DAY_SECONDS = 86_400n;
+const MAX_VESTING_DAYS = 3650;
+
+const PLACEHOLDER_NAME = "CHANGE ME";
+const PLACEHOLDER_SYMBOL = "CHANGEME";
+
+// Lettres (accents compris), chiffres, espaces et ponctuation courante.
+const NAME_PATTERN = /^[\p{L}\p{N} .,'&!?-]{1,40}$/u;
+const SYMBOL_PATTERN = /^[A-Z0-9]{2,11}$/;
+
+/** Minuscules, chiffres « 0 » lus comme « o », tout le reste retiré. */
+function normalizeForBrandCheck(value: string): string {
+  return value
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/0/g, "o")
+    .replace(/[^a-z0-9]/g, "");
+}
+
+/**
+ * Les conditions de Robinhood Chain (section 5.7 et 5.11) interdisent ses
+ * marques, ou toute marque qui y ressemble, dans un nom ou un ticker de token,
+ * ainsi que toute référence à $HOOD.
+ */
+export function containsRobinhoodMark(value: string): boolean {
+  return normalizeForBrandCheck(value).includes("hood");
+}
+
+export function isPlaceholder(params: TokenParams): boolean {
+  return params.name === PLACEHOLDER_NAME || params.symbol === PLACEHOLDER_SYMBOL;
+}
+
+export function validateTokenParams(
+  params: TokenParams,
+  options: { allowPlaceholder: boolean },
+): void {
+  const problems: string[] = [];
+
+  if (params.name !== params.name.trim()) {
+    problems.push("le nom commence ou finit par un espace");
+  }
+  if (!NAME_PATTERN.test(params.name)) {
+    problems.push(
+      "le nom doit faire 1 à 40 caractères (lettres, chiffres, espaces, . , ' & ! ? -)",
+    );
+  }
+  if (!SYMBOL_PATTERN.test(params.symbol)) {
+    problems.push("le symbole doit faire 2 à 11 caractères, en majuscules et chiffres seulement");
+  }
+  if (params.supply < 1n || params.supply > MAX_WHOLE_TOKENS) {
+    problems.push(
+      `l'offre doit être comprise entre 1 et ${MAX_WHOLE_TOKENS} tokens ` +
+        "(borne uint112 des réserves Uniswap v2)",
+    );
+  }
+  if (containsRobinhoodMark(params.name) || containsRobinhoodMark(params.symbol)) {
+    problems.push(
+      "le nom ou le symbole contient « hood » : les conditions de Robinhood Chain interdisent " +
+        "leurs marques (ou une marque qui y ressemble) dans un nom ou un ticker de token, " +
+        "et toute référence à $HOOD",
+    );
+  }
+  if (!options.allowPlaceholder && isPlaceholder(params)) {
+    problems.push("remplace le nom et le symbole d'exemple dans launch.config.ts");
+  }
+
+  if (problems.length > 0) {
+    throw new LaunchError(`Paramètres du token invalides :\n  - ${problems.join("\n  - ")}`);
+  }
+}
+
+export function validateLiquidityParams(params: LiquidityParams): ValidatedLiquidity {
+  let ethAmountWei: bigint;
+  try {
+    ethAmountWei = parseEther(params.ethAmount);
+  } catch {
+    throw new LaunchError(
+      `liquidity.ethAmount invalide : "${params.ethAmount}" (attendu un nombre en ETH, ex. "0.5").`,
+    );
+  }
+  if (ethAmountWei <= 0n) {
+    throw new LaunchError("liquidity.ethAmount doit être strictement positif.");
+  }
+  if (!Number.isInteger(params.tokenPercent) || params.tokenPercent < 1 || params.tokenPercent > 100) {
+    throw new LaunchError("liquidity.tokenPercent doit être un entier entre 1 et 100.");
+  }
+  return { ethAmountWei, tokenPercent: BigInt(params.tokenPercent) };
+}
+
+/** Casse mixte (somme de contrôle EIP-55) : une faute de frappe dans l'adresse serait détectée. */
+function hasChecksumCase(address: string): boolean {
+  const hex = address.slice(2);
+  return !/[a-fA-F]/.test(hex) || (/[a-f]/.test(hex) && /[A-F]/.test(hex));
+}
+
+/**
+ * Réserve communauté : un pourcentage entier de l'offre, envoyé à un wallet
+ * neuf et public. Le contrôle « pas un contrat » demande la chaîne : il est
+ * fait par le script de blocage, avant tout envoi.
+ */
+export function validateCommunityParams(
+  params: CommunityParams,
+  deployer: string,
+  tokenPercent: bigint,
+): ValidatedCommunity {
+  const problems: string[] = [];
+  if (!Number.isInteger(params.percent) || params.percent < 0 || params.percent > 99) {
+    problems.push("community.percent doit être un nombre entier entre 0 et 99");
+  } else if (tokenPercent + BigInt(params.percent) > 100n) {
+    problems.push(
+      `liquidity.tokenPercent (${tokenPercent}) + community.percent (${params.percent}) dépasse 100 : ` +
+        "le pool et la réserve ne peuvent pas recevoir plus que l'offre",
+    );
+  }
+  const requested = params.beneficiary.trim();
+  let beneficiary: string | undefined;
+  if (problems.length === 0 && params.percent > 0) {
+    const advice = "utilise un wallet neuf, dédié à la communauté, dont tu gardes la clé";
+    if (requested === "") {
+      problems.push(`community.beneficiary est obligatoire quand community.percent > 0 : ${advice}`);
+    } else {
+      try {
+        beneficiary = getAddress(requested);
+        if (!hasChecksumCase(requested)) {
+          problems.push(
+            "community.beneficiary doit être recopiée avec ses majuscules et minuscules d'origine (copie-la " +
+              "depuis ton wallet) : c'est ce qui permet de détecter une faute de frappe",
+          );
+        } else if (beneficiary === ZeroAddress || beneficiary === getAddress(DEAD_ADDRESS)) {
+          problems.push("community.beneficiary ne peut être ni l'adresse 0 ni l'adresse morte : la réserve serait perdue");
+        } else if (beneficiary === getAddress(deployer)) {
+          problems.push(
+            `community.beneficiary ne peut pas être le wallet de déploiement : la réserve doit se voir à part ; ${advice}`,
+          );
+        }
+      } catch {
+        problems.push(`community.beneficiary n'est pas une adresse valide (ou sa casse est fausse) : "${requested}"`);
+      }
+    }
+  }
+  if (problems.length > 0) {
+    throw new LaunchError(`Paramètres de la réserve communauté invalides :\n  - ${problems.join("\n  - ")}`);
+  }
+  return { percent: BigInt(params.percent), beneficiary: params.percent > 0 ? beneficiary : undefined };
+}
+
+export function validateVestingParams(params: VestingParams, deployer: string): ValidatedVesting {
+  const problems: string[] = [];
+  if (!Number.isInteger(params.durationDays) || params.durationDays < 1 || params.durationDays > MAX_VESTING_DAYS) {
+    problems.push(`vesting.durationDays doit être un nombre entier de jours entre 1 et ${MAX_VESTING_DAYS}`);
+  }
+  // Au moins un jour : rien ne doit pouvoir sortir du contrat avant l'ouverture du pool.
+  if (!Number.isInteger(params.cliffDays) || params.cliffDays < 1 || params.cliffDays > params.durationDays) {
+    problems.push("vesting.cliffDays doit être un nombre entier de jours entre 1 et vesting.durationDays");
+  }
+  let beneficiary = getAddress(deployer);
+  const requested = params.beneficiary.trim();
+  if (requested !== "") {
+    try {
+      beneficiary = getAddress(requested);
+      const checksummed = hasChecksumCase(requested);
+      if (beneficiary === ZeroAddress || beneficiary === getAddress(DEAD_ADDRESS)) {
+        problems.push("vesting.beneficiary ne peut être ni l'adresse 0 ni l'adresse morte : la part serait perdue");
+      } else if (!checksummed && beneficiary !== getAddress(deployer)) {
+        // Tout en minuscules (ou majuscules), une faute de frappe passerait inaperçue.
+        problems.push(
+          "vesting.beneficiary doit être recopiée avec ses majuscules et minuscules d'origine (copie-la depuis " +
+            "ton wallet) : c'est ce qui permet de détecter une faute de frappe. Ou laisse vide pour utiliser " +
+            "le wallet de déploiement",
+        );
+      }
+    } catch {
+      problems.push(`vesting.beneficiary n'est pas une adresse valide (ou sa casse est fausse) : "${requested}"`);
+    }
+  }
+  if (problems.length > 0) {
+    throw new LaunchError(`Paramètres du blocage invalides :\n  - ${problems.join("\n  - ")}`);
+  }
+  return {
+    enabled: params.enabled,
+    durationSeconds: BigInt(params.durationDays) * DAY_SECONDS,
+    cliffSeconds: BigInt(params.cliffDays) * DAY_SECONDS,
+    beneficiary,
+  };
+}
+
+export interface NftCharity {
+  name: string;
+  address: string;
+  /** Site de la fondation (facultatif), https. */
+  url?: string;
+}
+
+export interface NftParams {
+  /** Début du mint, date ISO en UTC (ex. "2026-12-01T20:00:00Z"). Vide = maintenant (testnet seulement). */
+  mintStart: string;
+  /** Wallet des fondateurs ; vide = le wallet de déploiement. */
+  founders: string;
+  /** 2 à 5 fondations candidates au départ ; les détenteurs en proposent d'autres ensuite. */
+  charities: readonly NftCharity[];
+  /** Adresse publique des images : <imageBaseURI><numéro>.png */
+  imageBaseURI: string;
+  /** Page qui affiche une carte : <viewerURI>?id=<numéro> */
+  viewerURI: string;
+}
+
+export interface ValidatedNft {
+  founders: string;
+  community: string;
+  mintStart: bigint;
+  imageBaseURI: string;
+  viewerURI: string;
+  candidateNames: string[];
+  candidateWallets: string[];
+  candidateUrls: string[];
+}
+const CHARITY_NAME_PATTERN = /^[\p{L}\p{N} .,'&()-]{1,40}$/u;
+
+/** Adresse obligatoire, avec sa casse d'origine, ni 0 ni l'adresse morte. */
+function checkedAddress(label: string, value: string, problems: string[]): string | undefined {
+  try {
+    const address = getAddress(value.trim());
+    if (!hasChecksumCase(value.trim())) {
+      problems.push(`${label} doit être recopiée avec ses majuscules et minuscules d'origine`);
+    } else if (address === ZeroAddress || address === getAddress(DEAD_ADDRESS)) {
+      problems.push(`${label} ne peut être ni l'adresse 0 ni l'adresse morte`);
+    } else {
+      return address;
+    }
+  } catch {
+    problems.push(`${label} n'est pas une adresse valide : "${value}"`);
+  }
+  return undefined;
+}
+
+/**
+ * Paramètres des cartes NFT. Sur le mainnet, tout doit être rempli : date de
+ * début, wallet communauté, fondations réelles, adresses publiques des images.
+ * Sur le testnet, les valeurs vides sont remplacées par des valeurs d'essai.
+ */
+export function validateNftParams(
+  params: NftParams,
+  options: { deployer: string; community: string; isMainnet: boolean; now: bigint },
+): ValidatedNft {
+  const problems: string[] = [];
+  const { deployer, isMainnet, now } = options;
+
+  let mintStart = now;
+  if (params.mintStart.trim() === "") {
+    if (isMainnet) problems.push("nft.mintStart est obligatoire sur le mainnet (date ISO en UTC, ex. \"2026-12-01T20:00:00Z\")");
+  } else {
+    const parsed = Date.parse(params.mintStart);
+    if (Number.isNaN(parsed) || !/(Z|[+-]\d{2}:\d{2})$/.test(params.mintStart.trim())) {
+      problems.push(`nft.mintStart n'est pas une date ISO avec fuseau (ex. "2026-12-01T20:00:00Z") : "${params.mintStart}"`);
+    } else {
+      mintStart = BigInt(Math.floor(parsed / 1000));
+    }
+  }
+
+  const founders =
+    params.founders.trim() === "" ? getAddress(deployer) : checkedAddress("nft.founders", params.founders, problems);
+
+  let community = options.community.trim() === "" ? "" : checkedAddress("community.beneficiary", options.community, problems);
+  if (community === "") {
+    if (isMainnet) {
+      problems.push("community.beneficiary est obligatoire : c'est lui qui reçoit 40 % des mints et frappe la réserve");
+    } else {
+      community = getAddress(deployer);
+    }
+  }
+
+  let charities = params.charities;
+  if (charities.length === 0 && !isMainnet) {
+    // Testnet sans fondations : deux adresses d'essai distinctes (le contrat refuse les doublons).
+    charities = [
+      { name: "Test A", address: "0x0000000000000000000000000000000000001111" },
+      { name: "Test B", address: "0x0000000000000000000000000000000000002222" },
+    ];
+  }
+  const candidateNames: string[] = [];
+  const candidateWallets: string[] = [];
+  const candidateUrls: string[] = [];
+  if (charities.length < 2 || charities.length > 5) {
+    problems.push("nft.charities doit contenir de 2 à 5 fondations { name, address }");
+  } else {
+    charities.forEach((charity, i) => {
+      if (!CHARITY_NAME_PATTERN.test(charity.name)) {
+        problems.push(`nft.charities[${i}].name doit faire 1 à 40 caractères (lettres, chiffres, espaces, . , ' & ( ) -)`);
+      }
+      const address = checkedAddress(`nft.charities[${i}].address`, charity.address, problems);
+      const url = (charity.url ?? "").trim();
+      if (url !== "" && (!/^https:\/\/[^\s"\\]+$/.test(url) || url.length > 120)) {
+        problems.push(`nft.charities[${i}].url doit être vide ou une adresse https (120 caractères au plus)`);
+      }
+      if (address !== undefined) {
+        if (candidateWallets.includes(address)) problems.push(`nft.charities[${i}].address apparaît deux fois`);
+        candidateNames.push(charity.name);
+        candidateWallets.push(address);
+        candidateUrls.push(url);
+      }
+    });
+  }
+
+  const uri = (label: string, value: string, fallback: string): string => {
+    if (value.trim() === "") {
+      if (isMainnet) problems.push(`${label} est obligatoire sur le mainnet (adresse https publique)`);
+      return fallback;
+    }
+    if (!/^https:\/\/[^\s"\\]+$/.test(value.trim())) problems.push(`${label} doit être une adresse https sans espace ni guillemet`);
+    return value.trim();
+  };
+  const imageBaseURI = uri("nft.imageBaseURI", params.imageBaseURI, "https://example.invalid/cards/");
+  const viewerURI = uri("nft.viewerURI", params.viewerURI, "https://example.invalid/card.html");
+
+  if (problems.length > 0) {
+    throw new LaunchError(`Paramètres des cartes NFT invalides :\n  - ${problems.join("\n  - ")}`);
+  }
+  return {
+    founders: founders as string,
+    community: community as string,
+    mintStart,
+    imageBaseURI,
+    viewerURI,
+    candidateNames,
+    candidateWallets,
+    candidateUrls,
+  };
+}

@@ -1,0 +1,22 @@
+# Dépendances
+/node_modules
+
+# Sorties de compilation Hardhat
+/artifacts
+/cache
+/dist
+/types
+/coverage
+
+# Fichiers d'environnement : les secrets vont dans le keystore chiffré de Hardhat,
+# jamais dans le dépôt
+.env
+.env.*
+!.env.example
+
+# Les fichiers deployments/*.json restent suivis : une fois chaque étape
+# « confirmed », ce sont des données publiques (adresses, transactions) qui servent
+# de journal du lancement. Ne pousse pas un journal qui contient une entrée
+# « pending » : elle renferme une transaction signée pas encore diffusée.
+# Le verrou d'exécution, lui, ne doit jamais être suivi.
+/deployments/*.lock
