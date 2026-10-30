@@ -38,7 +38,7 @@ export const launchConfig = {
     // déploiement et 30 jours après (au moins 1 h après sur le mainnet) : laisse le temps de
     // vérifier les contrats et d'annoncer l'heure. Avant, personne ne peut acheter. C'est aussi
     // le début du calendrier du blocage. Obligatoire sur le mainnet.
-    openAt: "",
+    openAt: "2026-11-12T00:00:00Z",
   },
   community: {
     // Réserve communauté (concours de mèmes, récompenses), en % de l'offre (0 à 99).
