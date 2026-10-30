@@ -267,6 +267,42 @@ contract DipDuckCardsTest {
         require(cards.reservedMinted() == 0 && !cards.trophyReceived(BOB), "rien de frappe");
     }
 
+    /// @dev Graine dont le premier octet vaut `first` (jackpot Trophée si < 23).
+    function _seedWithFirstByte(uint8 first, uint256 i) private pure returns (bytes32) {
+        return bytes32((uint256(first) << 248) | (uint256(keccak256(abi.encode("graine", i))) >> 8));
+    }
+
+    function test_TrophyFloorFavouredOutsideTheJackpot() public view {
+        uint256 n = 400;
+        uint256 floorNormal;
+        uint256 floorJackpot;
+        for (uint256 i = 0; i < n; i++) {
+            // Fond : plancher « sunset » (220), le reste 480 au total.
+            if (cards.pickTrophyFor("Winner", 0, 0, 0, _seedWithFirstByte(23, i), 0) == 1) floorNormal++;
+            if (cards.pickTrophyFor("Winner", 0, 0, 0, _seedWithFirstByte(22, i), 0) == 1) floorJackpot++;
+        }
+        // Hors jackpot : 220 x 8 / (1760 + 480) ≈ 79 % ; jackpot : 220 / 700 ≈ 31 %.
+        require(floorNormal > (n * 70) / 100, "hors jackpot : surtout le plancher");
+        require(floorJackpot > (n * 20) / 100 && floorJackpot < (n * 42) / 100, "jackpot : poids normaux");
+    }
+
+    function test_FrameHasFiveOptionsAndCheeksFour() public view {
+        uint256 n = 2000;
+        uint256 obsidian;
+        uint256 noCheeks;
+        for (uint256 i = 0; i < n; i++) {
+            bytes32 seed = keccak256(abi.encode("cadre", i));
+            uint8 frame = cards.pickFor("bob", 2, 0, 0, seed, 6);
+            uint8 cheeks = cards.pickFor("bob", 2, 0, 0, seed, 7);
+            require(frame < 5 && cheeks < 4, "5 cadres, 4 joues");
+            if (frame == 4) obsidian++;
+            if (cheeks == 0) noCheeks++;
+        }
+        // Obsidienne : 0,5 % ; joues « none » : 60 %.
+        require(obsidian > 0 && obsidian < 30, "le cadre obsidienne existe et reste rare");
+        require(noCheeks > (n * 55) / 100 && noCheeks < (n * 65) / 100, "joues : 60 % sans rien");
+    }
+
     function test_TrophyDrawSkipsTheCommonestOptions() public view {
         uint256 n = 300;
         uint256 crowns;
@@ -276,10 +312,15 @@ contract DipDuckCardsTest {
                 uint8 floor = t == 6 || t == 7 ? 2 : 1;
                 require(cards.pickTrophyFor("Winner", 0, 0, 0, seed, t) >= floor, "jamais l'option la plus commune");
             }
-            if (cards.pickTrophyFor("Winner", 1, 0, 0, seed, 2) == 3) crowns++;
         }
-        // Les secrets s'appliquent aussi : courageux, couronne x1,5 (poids 90 sur 550 sans « none »).
-        require(crowns > (n * 12) / 100, "secrets actifs sur le Trophee");
+        // Les secrets s'appliquent aussi : courageux, couronne x1,5 (comparé à calme).
+        uint256 calmCrowns;
+        for (uint256 i = 0; i < 1000; i++) {
+            bytes32 seed = keccak256(abi.encode("couronne", i));
+            if (cards.pickTrophyFor("Winner", 1, 0, 0, seed, 2) == 3) crowns++;
+            if (cards.pickTrophyFor("Winner", 0, 0, 0, seed, 2) == 3) calmCrowns++;
+        }
+        require(crowns > calmCrowns && crowns > 50, "secrets actifs sur le Trophee");
         // Graine nulle (carte Plain) : le plancher, ni plus ni moins.
         for (uint256 t = 0; t < 10; t++) {
             require(cards.pickTrophyFor("Winner", 0, 0, 0, 0, t) == (t == 6 || t == 7 ? 2 : 1), "Plain : plancher");

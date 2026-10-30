@@ -59,6 +59,10 @@ contract DipDuckCards is ERC721 {
     uint256 public constant RESERVED = 111;
     /// @dev Un wallet qui détient plus de cartes ne peut pas recevoir de Trophée.
     uint256 private constant TROPHY_MAX_BALANCE = 2;
+    /// @dev Tirage Trophée (voir `_pick`) : poids de l'option plancher hors jackpot, et seuil du
+    ///      jackpot sur le premier octet de la graine (23 / 256 ≈ 9 %).
+    uint256 internal constant TROPHY_FLOOR_WEIGHT = 8;
+    uint256 internal constant TROPHY_JACKPOT = 23;
     uint256 public constant PRICE = 0.001 ether;
     uint256 internal constant MAX_PER_WALLET = 10;
     /// @notice Délai entre le mint et la révélation, en blocs (`block.number`).
@@ -95,7 +99,7 @@ contract DipDuckCards is ERC721 {
     bytes private constant WEIGHTS =
         hex"012c00dc00b4008c005a003200120002020800b4008c005a002d0014000501c200c80096005a003c0028000a02bc00780064003c0014025800dc0082003201f400c8009600640028000a01f4012c0096002d0005025800fa0064003201f400b400820050003c001e0014022600a0008200780028";
     // Début de chaque attribut dans WEIGHTS / OPTION_NAMES (en options), et fin.
-    bytes private constant OFFSETS = hex"00080f161b1f25292e353a";
+    bytes private constant OFFSETS = hex"00080f161b1f252a2e353a";
     bytes private constant OPTION_NAMES =
         "pond,sunset,candles,night,crash,vault,cosmic,diamond,"
         "classic,midnight,ice,ember,shadow,golden,alien,"
@@ -455,17 +459,25 @@ contract DipDuckCards is ERC721 {
 
     /// @dev Tirage d'un attribut. Carte Trophée : tirage à part, sans l'option la plus commune
     ///      (sans les deux plus communes pour le cadre et les joues) : son score de rareté sur
-    ///      le site vaut au moins celui du top 3,6 % (« épique »). Les cartes achetées gardent
-    ///      exactement leurs tirages. Graine nulle (carte Plain) : l'option la plus commune permise.
+    ///      le site vaut au moins celui du top 3,6 % (« épique »). Hors « jackpot », l'option
+    ///      plancher pèse TROPHY_FLOOR_WEIGHT fois plus ; jackpot (premier octet de la graine
+    ///      < TROPHY_JACKPOT, ≈ 9 %) : poids normaux. Visé : ≈ 70 % épique, 25 % légendaire,
+    ///      5 % mythique. Les cartes achetées gardent exactement leurs tirages. Graine nulle
+    ///      (carte Plain) : l'option la plus commune permise (le plancher, épique, pour un Trophée).
     function _pick(Card memory card, bytes32 seed, uint256 t) internal pure returns (uint8) {
         uint256 start = uint8(OFFSETS[t]);
         uint256 count = uint8(OFFSETS[t + 1]) - start;
-        uint256 floor = card.trophy ? (t == 6 || t == 7 ? 2 : 1) : 0;
+        uint256 floor;
+        uint256 floorWeight = 1;
+        if (card.trophy) {
+            floor = t == 6 || t == 7 ? 2 : 1;
+            if (uint8(seed[0]) >= TROPHY_JACKPOT) floorWeight = TROPHY_FLOOR_WEIGHT;
+        }
         uint256[8] memory weights;
         uint256 sum;
         for (uint256 i = floor; i < count; i++) {
             uint256 base = (uint256(uint8(WEIGHTS[(start + i) * 2])) << 8) | uint8(WEIGHTS[(start + i) * 2 + 1]);
-            weights[i] = base * _boost(card, t, i);
+            weights[i] = base * _boost(card, t, i) * (i == floor ? floorWeight : 1);
             sum += weights[i];
         }
         uint256 roll = seed == 0 ? 0 : (uint256(uint32(uint256(keccak256(abi.encode(seed, t))))) * sum) >> 32;

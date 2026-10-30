@@ -1,5 +1,5 @@
 import { expect } from "chai";
-import { Contract, Wallet, encodeBytes32String, getAddress, parseEther } from "ethers";
+import { AbiCoder, Contract, Wallet, ZeroHash, encodeBytes32String, getAddress, getBytes, keccak256, parseEther, toBeHex } from "ethers";
 import { network } from "hardhat";
 
 import { LaunchError } from "../scripts/lib/errors.ts";
@@ -50,6 +50,68 @@ const WEIGHTS = [
 const rarityScore = (traits: number[]) => traits.reduce((sum, option, t) => sum - Math.log2(WEIGHTS[t][option] / 1000), 0);
 // Plancher du tirage Trophée : sans l'option la plus commune (les deux pour le cadre et les joues).
 const TROPHY_FLOOR = WEIGHTS.map((_, t) => (t === 6 || t === 7 ? 2 : 1));
+// Tirage Trophée hors jackpot : l'option plancher pèse 8 fois plus ; jackpot si le premier octet
+// de la graine est < 23 (≈ 9 %) : poids normaux.
+const TROPHY_FLOOR_WEIGHT = 8n;
+const TROPHY_JACKPOT = 23;
+
+type DrawInput = { name: string; mood: number; element: number; lucky: number; trophy: boolean };
+
+/** Multiplicateur des secrets (en %), copie exacte de `_boost`. */
+function boostPercent(card: DrawInput, t: number, i: number): bigint {
+  const { mood, element: e, lucky } = card;
+  const seven = lucky > 0 && String(lucky).includes("7");
+  if (t === 0 && i === 3 && mood === 2) return 200n;
+  if (t === 1 && i === 2 && e === 2) return 200n;
+  if (t === 1 && i === 5 && card.name.toLowerCase() === "satoshi") return 300n;
+  if (t === 2 && i === 3 && mood === 1) return 150n;
+  if (t === 2 && i === 4 && mood === 0) return 200n;
+  if (t === 3 && i === 1 && e === 1) return 200n;
+  if (t === 5 && i === 1 && e === 0) return 200n;
+  if (t === 5 && i === 2 && mood === 3) return 200n;
+  if (t === 5 && i === 5 && e === 3) return 300n;
+  if (t === 6 && (i === 2 || i === 3) && seven) return 150n;
+  if (t === 7 && i === 1 && mood === 0) return 150n;
+  if (t === 7 && i === 3 && mood === 1) return 200n;
+  if (t === 8 && i === 5 && lucky === 777) return 300n;
+  if (t === 8 && i === 6 && mood === 3) return 200n;
+  if (t === 9 && i === 2 && e === 2) return 200n;
+  if (t === 9 && i === 4 && e === 3) return 200n;
+  return 100n;
+}
+
+/** Les 10 attributs tirés depuis la graine, copie exacte de `_pick` (cartes achetées et Trophées). */
+function drawTraits(card: DrawInput, seed: string): number[] {
+  const coder = AbiCoder.defaultAbiCoder();
+  const floorWeight = card.trophy && getBytes(seed)[0] >= TROPHY_JACKPOT ? TROPHY_FLOOR_WEIGHT : 1n;
+  return WEIGHTS.map((options, t) => {
+    const floor = card.trophy ? TROPHY_FLOOR[t] : 0;
+    const weights = options.map((w, i) =>
+      i < floor ? 0n : BigInt(w) * boostPercent(card, t, i) * (i === floor ? floorWeight : 1n),
+    );
+    const sum = weights.reduce((a, b) => a + b, 0n);
+    const hash = BigInt(keccak256(coder.encode(["bytes32", "uint256"], [seed, t])));
+    let roll = seed === ZeroHash ? 0n : ((hash & 0xffffffffn) * sum) >> 32n;
+    for (let i = floor; i < options.length; i++) {
+      if (roll < weights[i]) return i;
+      roll -= weights[i];
+    }
+    return options.length - 1;
+  });
+}
+
+/** Seuils de score des paliers du site (top 5 % épique, 1 % légendaire, 0,1 % mythique), tirage normal simulé. */
+function tierThresholds(samples = 400_000) {
+  let state = 2024;
+  const random = () => ((state = (Math.imul(state, 1103515245) + 12345) >>> 0) / 2 ** 32);
+  const pick = (weights: number[]) => {
+    let roll = random() * 1000;
+    for (let i = 0; i < weights.length; i++) if ((roll -= weights[i]) < 0) return i;
+    return weights.length - 1;
+  };
+  const scores = Array.from({ length: samples }, () => rarityScore(WEIGHTS.map(pick))).sort((a, b) => b - a);
+  return { epic: scores[samples * 0.05], legendary: scores[samples * 0.01], mythic: scores[samples * 0.001] };
+}
 
 const CHARITIES = [
   { name: "Fondation A", address: "0x90F79bf6EB2c4f870365E785982E1f101E93b906" },
@@ -230,5 +292,80 @@ describe("Cartes NFT : déploiement journalisé, mint, révélation, métadonné
     await expect(asWinner.vote([3], 0)).to.be.revertedWithCustomError(asWinner, "NotEligible").withArgs(3n);
     await (await asWinner.vote([1, 2], 0)).wait();
     expect(await community.votesFor(0, 0)).to.equal(2n);
+  });
+});
+
+describe("Cartes Trophée : répartition des paliers", function () {
+  it("la copie du tirage donne exactement les attributs du contrat (Trophées et cartes achetées)", async function () {
+    const wallet = await localWallet(connection);
+    const ctx: StepContext = { ethers, wallet, journal: memoryJournal(), networkName: "test", chainId, confirm: async () => {}, log: () => {}, receiptTimeoutMs: 1500 };
+    const now = BigInt(await networkHelpers.time.latest());
+    const plan = validateNftParams(
+      { mintStart: "", founders: "", charities: CHARITIES, imageBaseURI: "https://dipduck.example/cards/", viewerURI: "https://dipduck.example/card.html" },
+      { deployer: wallet.address, community: "", isMainnet: false, now },
+    );
+    const record = await deployNftStep(ctx, plan);
+    const abi = [...CARDS_ABI, "event Revealed(uint256 indexed tokenId, bytes32 seed)"];
+    const community = new Contract(record.address, abi, await ethers.getSigner(plan.community));
+    const signers = await ethers.getSigners();
+    const winners = signers.filter((s) => getAddress(s.address) !== getAddress(plan.community)).slice(0, 12);
+    const inputs: DrawInput[] = [];
+    for (const [k, winner] of winners.entries()) {
+      const card = {
+        name: k === 0 ? "satoshi" : `Winner${k}`,
+        mood: k % 4,
+        element: (k >> 2) % 4,
+        lucky: k === 1 ? 777 : 70 + k,
+        trophy: k % 3 !== 2,
+      };
+      if (card.trophy) {
+        await (await community.mintTrophy(winner.address, encodeBytes32String(card.name), card.mood, card.element, card.lucky)).wait();
+      } else {
+        const buyer = new Contract(record.address, CARDS_ABI, winner);
+        await (await buyer.mint(encodeBytes32String(card.name), card.mood, card.element, card.lucky, 1, { value: parseEther("0.001") })).wait();
+      }
+      inputs.push(card);
+    }
+    await networkHelpers.mine(3);
+    await (await community.revealMany(inputs.map((_, k) => k + 1))).wait();
+    // Les mints révèlent aussi au passage : on relit tous les événements Revealed.
+    const seeds = new Map<number, string>();
+    for (const event of await community.queryFilter(community.filters.Revealed())) {
+      if ("args" in event) seeds.set(Number(event.args.tokenId), event.args.seed as string);
+    }
+    expect(seeds.size).to.equal(inputs.length);
+    for (const [k, card] of inputs.entries()) {
+      const [traits] = (await community.traitsOf(k + 1)) as [bigint[], boolean];
+      expect(Array.from(traits, Number), `carte ${k + 1}`).to.deep.equal(drawTraits(card, seeds.get(k + 1)!));
+      expect((await community.cardOf(k + 1)).trophy).to.equal(card.trophy);
+    }
+  });
+
+  it("Trophées : ≈ 70 % épiques, 25 % légendaires, 5 % mythiques, jamais sous épique ; achetées : mythique ≈ 0,1 %", function () {
+    this.timeout(120_000);
+    const { epic, legendary, mythic } = tierThresholds();
+    expect(rarityScore(TROPHY_FLOOR)).to.be.above(epic); // Plain et pire tirage Trophée : épique
+    const tally = (trophy: boolean, n: number) => {
+      const count = { below: 0, epic: 0, legendary: 0, mythic: 0 };
+      for (let i = 0; i < n; i++) {
+        const seed = keccak256(toBeHex(i + (trophy ? 0 : 1_000_000), 32));
+        const card = { name: "Duck", mood: i % 4, element: (i >> 2) % 4, lucky: (i * 37) % 1000, trophy };
+        const score = rarityScore(drawTraits(card, seed));
+        if (score > mythic) count.mythic++;
+        else if (score > legendary) count.legendary++;
+        else if (score > epic) count.epic++;
+        else count.below++;
+      }
+      return count;
+    };
+    const n = 6_000;
+    const trophies = tally(true, n);
+    expect(trophies.below).to.equal(0);
+    expect(trophies.epic / n).to.be.within(0.66, 0.75);
+    expect(trophies.legendary / n).to.be.within(0.21, 0.29);
+    expect(trophies.mythic / n).to.be.within(0.035, 0.07);
+    const paid = tally(false, n);
+    expect(paid.mythic / n).to.be.below(0.004); // ≈ 0,1 % (un peu plus avec les secrets)
+    expect(paid.below / n).to.be.above(0.9);
   });
 });
