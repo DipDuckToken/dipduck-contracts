@@ -51,7 +51,7 @@ export const launchConfig = {
     // Il reçoit aussi 60 % des frais d'échange du pool. Le Safe doit EXISTER avant npm run deploy:mainnet :
     // le script refuse de déployer si cette adresse n'est pas un vrai Safe (elle est gravée dans
     // le lanceur). Obligatoire. Colle-la avec ses majuscules et minuscules d'origine.
-    beneficiary: "",
+    beneficiary: "0x14aaC4b3072022142a2Fd597ED29FDC7bF602CFF",
   },
   team: {
     // Safe 2 sur 3 de l'équipe (app.safe.global, réseau Robinhood Chain), avec les MÊMES 3 clés
@@ -60,7 +60,7 @@ export const launchConfig = {
     // en être propriétaire. Il doit EXISTER avant npm run deploy:mainnet : le script vérifie que
     // c'est un vrai Safe (son adresse est gravée dans le lanceur). Obligatoire sur le mainnet ;
     // vide pour la répétition = un Safe d'essai. Colle-la avec ses majuscules et minuscules d'origine.
-    safe: "",
+    safe: "0x64bAC8D0b36C3c4c0749904ac1b9fF2508cb4002",
   },
   vesting: {
     // Ta part va dans un contrat de vesting déployé par npm run deploy:mainnet juste AVANT le
@@ -116,7 +116,7 @@ export const launchConfig = {
     // Reçoit 30 % des mints, adresse gravée à vie dans le contrat. Recommandé : le Safe fondateur
     // (2 sur 3, mêmes clés que le Safe communauté), vérifié par le script ; sinon le Ledger fondateur.
     // Obligatoire sur le mainnet, différent du wallet de déploiement.
-    founders: "0x711C887F1e3f11817eA28B5F0557fCfa4d9E00dA",
+    founders: "0x64bAC8D0b36C3c4c0749904ac1b9fF2508cb4002",
     // 2 à 5 fondations candidates au départ : { name: "…", address: "0x…", url: "https://…" }
     // (adresse avec sa casse d'origine, url facultative). Les détenteurs de cartes pourront
     // en proposer d'autres (20 au maximum). Obligatoire sur le mainnet ; sur le testnet,
