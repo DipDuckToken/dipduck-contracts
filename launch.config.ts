@@ -58,7 +58,7 @@ export const launchConfig = {
     // Colle-la avec ses majuscules et minuscules d'origine, et vérifie-la caractère par caractère.
     // Jamais une adresse liée à un autre projet ; garde bien sa clé : sans elle,
     // la part est perdue.
-    beneficiary: "",
+    beneficiary: "0x711C887F1e3f11817eA28B5F0557fCfa4d9E00dA",
   },
   game: {
     // Jeu « Attrape la baisse » (npm run game:deploy:mainnet) : un seul contrat pour toujours,
@@ -86,7 +86,7 @@ export const launchConfig = {
     mintStart: "",
     // Wallet fondateur (Ledger), le même que vesting.beneficiary : reçoit 30 % des mints.
     // Obligatoire sur le mainnet, différent du wallet de déploiement.
-    founders: "",
+    founders: "0x711C887F1e3f11817eA28B5F0557fCfa4d9E00dA",
     // 2 à 5 fondations candidates au départ : { name: "…", address: "0x…", url: "https://…" }
     // (adresse avec sa casse d'origine, url facultative). Les détenteurs de cartes pourront
     // en proposer d'autres (20 au maximum). Obligatoire sur le mainnet ; sur le testnet,
