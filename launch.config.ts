@@ -84,7 +84,8 @@ export const launchConfig = {
     // Début du mint et de la première période de 30 jours, date ISO en UTC
     // (ex. "2026-12-01T20:00:00Z"). Obligatoire sur le mainnet.
     mintStart: "",
-    // Wallet fondateur (Ledger), le même que vesting.beneficiary : reçoit 30 % des mints.
+    // Reçoit 30 % des mints, adresse gravée à vie dans le contrat. Recommandé : le Safe fondateur
+    // (2 sur 3, mêmes clés que le Safe communauté), vérifié par le script ; sinon le Ledger fondateur.
     // Obligatoire sur le mainnet, différent du wallet de déploiement.
     founders: "0x711C887F1e3f11817eA28B5F0557fCfa4d9E00dA",
     // 2 à 5 fondations candidates au départ : { name: "…", address: "0x…", url: "https://…" }

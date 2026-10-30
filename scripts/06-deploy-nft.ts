@@ -80,7 +80,12 @@ async function deployNft(connection: NetworkConnection, profile: NetworkProfile)
     if (profile.isMainnet || (await ethers.provider.getCode(plan.community)) !== "0x") {
       await assertSafe(ethers.provider, plan.community, signer.address, "Le wallet communauté");
     }
-    for (const address of [plan.founders, ...plan.candidateWallets]) {
+    // Fondateurs : un wallet ordinaire (Ledger) ou un vrai Safe 2 sur 3, gravé à vie dans le contrat :
+    // avec un Safe, un wallet perdu se remplace sans changer l'adresse.
+    if ((await ethers.provider.getCode(plan.founders)) !== "0x") {
+      await assertSafe(ethers.provider, plan.founders, signer.address, "Le wallet fondateurs");
+    }
+    for (const address of plan.candidateWallets) {
       if ((await ethers.provider.getCode(address)) !== "0x") {
         throw new LaunchError(
           `${address} est un contrat sur cette chaîne : les versements partent vers des wallets ordinaires. Rien n'a été envoyé.`,
