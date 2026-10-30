@@ -61,6 +61,22 @@ describe("Réserve communauté : vrai Safe 2 sur 3", function () {
     const notSafe = await ethers.deployContract("MockSafeSingleton", ["1.4.1"]);
     await expectLaunchError(assertSafe(ethers.provider, await notSafe.getAddress(), deployer.address, label), /pas un proxy Safe|version|propriétaires/);
   });
+
+  it("refuse un Safe avec un module ou un garde (ils contournent les signatures)", async function () {
+    const [deployer, other] = await ethers.getSigners();
+    const label = "Le wallet communauté";
+    const withModule = await deploySafe("1.4.1", owners, 2);
+    await (await ethers.getContractAt("MockSafe", withModule)).enableModule(other.address);
+    await expectLaunchError(assertSafe(ethers.provider, withModule, deployer.address, label), /un module est activé/);
+
+    const withGuard = await deploySafe("1.4.1", owners, 2);
+    await ethers.provider.send("hardhat_setStorageAt", [
+      withGuard,
+      "0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8",
+      ethers.zeroPadValue(other.address, 32),
+    ]);
+    await expectLaunchError(assertSafe(ethers.provider, withGuard, deployer.address, label), /garde de transactions/);
+  });
 });
 
 describe("Deux wallets : déploiement et fondateur", function () {

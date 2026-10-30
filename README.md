@@ -1,26 +1,60 @@
 # Memecoin sur Robinhood Chain — kit de lancement
 
-Un token ERC-20 minimal et les scripts pour le lancer proprement sur Robinhood Chain :
-déploiement, vérification du code sur Blockscout, ouverture du marché sur Uniswap v2 en
-une seule transaction avec les parts LP brûlées, blocage de ta part dans un contrat de
-vesting, et une répétition générale sur une copie locale du mainnet.
+Un token ERC-20 minimal et les scripts pour le lancer proprement sur Robinhood Chain avec
+une **courbe de lancement** (à la pump.fun) : tu n'apportes aucun ETH, la courbe vend le
+token à prix croissant à partir d'une heure annoncée, puis ouvre **toute seule** le pool
+Uniswap v2 quand elle a réuni sa cible, et brûle les parts LP. Ta part est versée à un
+contrat de blocage (vesting) et la réserve communauté à un Safe, au même moment.
+Vérification du code sur Blockscout et répétition générale sur une copie locale du
+mainnet comprises.
 
 Utilise un wallet neuf, dédié à ce token.
 
 ---
 
-## Les trois contrats
+## Les contrats
+
+### `contracts/LaunchCurve.sol` — la courbe de lancement
+
+C'est elle que tu déploies. Elle crée le token (elle en est le seul `LAUNCHER`) et en garde
+**100 %** : le wallet de déploiement ne détient jamais aucun token.
+
+- **Prix** : produit constant avec des réserves **virtuelles** (`virtualEth`) : le premier
+  acheteur paie déjà un vrai prix, sans que personne n'ait mis d'ETH réel. Le prix monte à
+  chaque achat et redescend à chaque revente.
+- **Achat et revente** (`buy`, `sell`) : à partir de l'heure d'ouverture (`openAt`), tout
+  le monde peut acheter et revendre à la courbe (au plus ce qu'elle a vendu), avec un
+  minimum reçu et une date limite (anti-sandwich). Pas de frais, pas d'owner, rien de
+  modifiable.
+- **Ouverture du pool (graduation)** : l'achat qui atteint la cible (`targetEth`) est
+  plafonné à l'ETH manquant (le surplus est rendu). Dans la même transaction, la courbe
+  verse ta part au contrat de blocage et la réserve au Safe communauté, brûle les arrondis,
+  puis met **tout l'ETH réuni** et le reste des tokens dans la paire Uniswap v2 au prix
+  exact de fin de courbe, et envoie les parts LP à `0x000000000000000000000000000000000000dEaD`.
+- **Personne ne peut ouvrir le pool avant elle** : le token refuse tout envoi vers la paire
+  qui ne vient pas de la courbe tant que le pool n'est pas ouvert. Une paire créée d'avance
+  par un tiers, ou un don de WETH, ne bloque rien.
+- **Cible jamais atteinte** : la courbe continue simplement de fonctionner ; ta part et la
+  réserve restent dedans (personne ne peut les revendre).
+
+**Anti-bot** : pendant les 24 h qui suivent `openAt`, un wallet ne peut pas détenir plus de
+**0,5 %** de l'offre (1re heure), puis 1 % (jusqu'à 6 h), puis 2 % (jusqu'à 24 h) en
+achetant sur la courbe. Après l'ouverture du pool, le token applique à son tour les mêmes
+24 h de limite sur Uniswap. Avec la config par défaut, 0,5 % de l'offre coûte ≈ 0,0097 ETH
+au premier achat : un robot paie dès la première seconde un vrai prix, et ne peut pas tout
+rafler.
 
 ### `contracts/MemeToken.sol` — le token
 
-Il hérite de l'ERC-20 d'OpenZeppelin 5.6.1 et n'ajoute qu'un constructeur.
+Il hérite de l'ERC-20 d'OpenZeppelin 5.6.1, créé par la courbe.
 
 | Ce qu'il fait | Ce qu'il ne fait pas |
 | --- | --- |
-| Émet toute l'offre une seule fois, au déploiement, vers ton wallet | Pas d'owner, aucune fonction d'administration |
+| Émet toute l'offre une seule fois, à sa création, vers la courbe | Pas d'owner, aucune fonction d'administration |
 | 18 décimales, nom et symbole fixés au déploiement | Pas d'émission après le déploiement (pas de `mint`) |
-| Offre bornée à `2^112 - 1` unités de base | Pas de pause, pas de liste noire, pas de taxe, pas de limite par transaction |
-| Transferts ERC-20 standard, montants exacts | N'accepte pas d'ETH (rien ne peut y rester bloqué) |
+| Offre bornée à `2^112 - 1` unités de base | Pas de pause, pas de liste noire, pas de taxe |
+| Limite par wallet pendant les 24 h qui suivent l'ouverture du pool, puis plus rien | N'accepte pas d'ETH (rien ne peut y rester bloqué) |
+| Avant l'ouverture, seule la courbe peut envoyer des tokens à la paire | |
 
 Pourquoi si peu : les scanners de risque (honeypot, rug) signalent toute fonction
 d'administration, et un contrat immuable ne peut être modifié par personne.
@@ -30,44 +64,17 @@ l'offre ne pourrait pas entrer dans le pool, et de grosses ventes échoueraient.
 tient aussi dans un u128 (CW20 en `Uint128`, `Balance` Substrate en `u128`), ce qui garde
 la porte ouverte à un pont lock-and-mint. Maximum : 5 192 296 858 534 827 tokens.
 
-### `contracts/PoolSeeder.sol` — l'ouverture du pool
-
-Il fait ce que fait le routeur Uniswap pour un premier dépôt (tokens et WETH envoyés à la
-paire, puis `mint`), mais en une seule transaction, avec les parts LP émises directement
-vers `0x000000000000000000000000000000000000dEaD`.
-
-Pourquoi ne pas passer par le routeur : entre le déploiement du token et l'ouverture du
-pool, n'importe qui peut créer la paire et y donner un peu de WETH. Si ce don est ensuite
-« synchronisé », le routeur refuse tout dépôt et le lancement est bloqué. Le PoolSeeder,
-lui, ignore ce piège : tout WETH encore dans la paire au moment de l'ouverture rejoint
-le pool et y reste verrouillé, comme ta liquidité.
-
-Attention, un don *non synchronisé* peut être repris par n'importe qui avant
-l'ouverture. Le plan affiche donc une fourchette : prix attendu, prix le plus bas (si ce
-don disparaît) et prix le plus haut accepté.
-
-Il refuse d'ouvrir dans deux cas seulement, sans rien déplacer :
-- des parts LP existent déjà (ce qui demande des tokens venant de ton wallet) ;
-- la paire contient nettement plus de WETH que lorsque tu as validé le plan : au-delà
-  d'une marge de 1 % de ton ETH, un don de dernière seconde relèverait ton prix de départ
-  à ton insu. La relance affiche alors le nouveau plan et te redemande ta confirmation.
-  La marge existe pour qu'un tiers ne puisse pas bloquer l'ouverture en ajoutant 1 wei
-  avant chaque essai.
-
-Pas d'owner, une seule fonction d'écriture (`seed`), et il ne garde jamais ni token, ni
-WETH, ni ETH, ni part LP. Il est déployé une fois par réseau, par l'étape de liquidité.
-
 ### `contracts/TokenVesting.sol` — le blocage de ta part
 
 Le `VestingWalletCliff` d'OpenZeppelin 5.6.1, sans modification sauf une (voir plus bas).
-Il garde ta part (les tokens que tu ne mets pas dans le pool) et la libère selon un
-calendrier fixé une fois pour toutes au déploiement :
+Il est déployé **juste avant la courbe** (il ne dépend pas du token) et reçoit ta part à
+l'ouverture du pool. Son calendrier, fixé une fois pour toutes, **commence à `openAt`** :
 - rien n'est libérable avant la **falaise** (par défaut 90 jours, au moins 1) ;
 - à la falaise, la part correspondant au temps écoulé devient libérable d'un coup
-  (90 jours sur 365 ≈ 25 %), puis le reste se libère seconde par seconde jusqu'à la
-  **fin** (par défaut 365 jours) ;
+  (90 jours sur 900 = 10 %), puis le reste se libère seconde par seconde jusqu'à la
+  **fin** (par défaut 900 jours) ;
 - n'importe qui peut déclencher le versement (`release`), mais les tokens vont toujours
-  au **bénéficiaire** (ton wallet de déploiement, sauf si tu en choisis un autre).
+  au **bénéficiaire** (ton wallet fondateur, `vesting.beneficiary`).
 
 Aucune fonction ne permet de retirer plus tôt, pas même au bénéficiaire. La seule
 modification : `renounceOwnership` est désactivée. Sans propriétaire, les tokens libérés
@@ -81,8 +88,11 @@ toujours. Le bénéficiaire peut seulement se faire remplacer par une autre adre
 
 - Node.js 22 LTS et npm.
 - Un **wallet neuf** pour le déploiement. Jamais une clé liée à un autre projet.
-- De l'ETH sur Robinhood Chain : le pool + quelques dollars de frais. Ponts listés dans
-  la doc : <https://docs.robinhood.com/chain/bridging> (pont Arbitrum officiel, Relay, Across, etc.).
+- Un peu d'ETH sur Robinhood Chain pour les **frais seulement** (deux déploiements) : tu
+  n'apportes aucun ETH au pool. Ponts listés dans la doc :
+  <https://docs.robinhood.com/chain/bridging> (pont Arbitrum officiel, Relay, Across, etc.).
+- Le **Safe communauté** (2 sur 3, sur app.safe.global, réseau Robinhood Chain) créé
+  **avant** le déploiement : son adresse est gravée dans la courbe.
 - Recommandé pour le jour J : une clé RPC Alchemy (le RPC public est limité en débit).
 
 ```bash
@@ -100,50 +110,70 @@ C'est le seul fichier à modifier.
 
 ```ts
 token: {
-  name: "CHANGE ME",       // 1 à 40 caractères
-  symbol: "CHANGEME",      // 2 à 11 caractères, majuscules et chiffres
+  name: "Dip Duck",        // 1 à 40 caractères
+  symbol: "DIPDUCK",       // 2 à 11 caractères, majuscules et chiffres
   supply: 1_000_000_000n,  // offre en tokens entiers
 },
-liquidity: {
-  ethAmount: "0.1",        // ETH mis dans le pool en face des tokens
-  tokenPercent: 87,        // part de l'offre mise dans le pool
+curve: {
+  tokenPercent: 87,        // part de l'offre confiée à la courbe (vendue + pool)
+  virtualEth: "4",         // réserve d'ETH virtuelle : fixe le prix de départ
+  targetEth: "3",          // ETH à réunir pour ouvrir le pool (il y va en entier)
+  openAt: "",              // heure d'ouverture des achats, ISO en UTC (obligatoire sur le mainnet)
 },
 community: {
   percent: 3,              // réserve communauté (concours, récompenses), 0 = aucune
-  beneficiary: "",         // wallet NEUF dédié à la communauté (obligatoire si percent > 0)
+  beneficiary: "",         // Safe 2 sur 3 dédié (obligatoire si percent > 0)
 },
 vesting: {
-  enabled: true,           // bloque ta part AVANT l'ouverture du pool
-  durationDays: 900,       // durée totale du blocage
+  enabled: true,           // ta part ne peut exister que bloquée
+  durationDays: 900,       // durée totale du blocage, à partir de openAt
   cliffDays: 90,           // rien n'est libérable avant (au moins 1 jour)
-  beneficiary: "",         // qui reçoit les tokens libérés ("" = wallet de déploiement)
+  beneficiary: "0x…",      // wallet fondateur (Ledger) qui reçoit les tokens libérés
 },
 ```
 
-La capitalisation de départ vaut `ethAmount × 100 / tokenPercent` : 0,1 ETH avec 100 %
-des tokens dans le pool, 0,105 ETH avec 95 %. Le prix de départ est `ethAmount` divisé par
-le nombre de tokens mis dans le pool. Les scripts refusent les valeurs d'exemple sur
-un vrai réseau, ainsi que tout nom ou symbole contenant « hood » (voir *Marque*).
+**Les chiffres de la courbe** (config par défaut, offre de 1 milliard) — le script de
+déploiement les recalcule avec les formules exactes du contrat et les affiche avant tout
+envoi :
+
+| | Valeur |
+| --- | --- |
+| Confiés à la courbe | 87 % : ≈ 55,4 % vendus sur la courbe, ≈ 31,6 % mis dans le pool, le reste (arrondis) brûlé |
+| Prix de départ | ≈ 0,0000000031 ETH par token (capitalisation de départ ≈ 3,10 ETH) |
+| 0,5 % de l'offre au premier achat | ≈ 0,0155 ETH |
+| Prix à l'ouverture du pool | × 3,06 (capitalisation ≈ 9,48 ETH) |
+| ETH dans le pool | 3 ETH, tout ce que la courbe a réuni |
+
+`virtualEth` fixe le prix de départ (plus il est haut, plus un robot paie cher dès la
+première seconde) ; `targetEth` fixe la taille du pool et le prix de fin (prix multiplié
+par `((virtualEth + targetEth) / virtualEth)²`). Les scripts refusent `virtualEth` hors de
+0,01–1 000 ETH, `targetEth` hors de 0,01–10 000 ETH, les valeurs d'exemple sur un vrai
+réseau et tout nom ou symbole contenant « hood » (voir *Marque*).
+
+**L'heure d'ouverture (`openAt`)** : une date ISO avec fuseau, par exemple
+`"2026-12-01T20:00:00Z"` (UTC). Le contrat exige qu'elle soit dans le futur et à 30 jours
+au plus du déploiement ; sur le mainnet, le script demande en plus **au moins 1 h** de
+marge, pour vérifier les contrats et annoncer l'heure. C'est aussi le début du calendrier
+du blocage. Annonce l'heure et l'adresse de la **courbe** : c'est là qu'on achète, pas sur
+Uniswap.
 
 **Combien de tokens ?** 1 milliard (la valeur par défaut) est le standard des memecoins :
 1 % de l'offre = 10 millions de tokens, facile à lire. L'offre ne change pas la
-capitalisation de départ, seulement le prix affiché par token : avec 0,1 ETH dans le
-pool, 1 milliard de tokens donne 0,0000000001 ETH par token ; 1 000 milliards en donnent
-mille fois moins, sans rien changer d'autre. C'est `ethAmount` qui fixe la valeur de
-départ.
+capitalisation, seulement le prix affiché par token : c'est `virtualEth` qui fixe la
+valeur de départ.
 
 **Combien garder ?** Ta part vaut `100 − tokenPercent − community.percent`. Par défaut :
-87 % au pool, 3 % de réserve communauté, 10 % pour toi, bloqués avant l'ouverture du pool.
-Tout le monde voit les plus gros détenteurs sur Blockscout et DexScreener : au-delà de
-10 %, une part de créateur est vue comme un risque. Avec `tokenPercent + community.percent`
-égal à 100, tu ne gardes rien et seul l'envoi de la réserve a lieu à l'étape de blocage.
+87 % à la courbe, 3 % de réserve communauté, 10 % pour toi. Tout le monde voit les plus
+gros détenteurs sur Blockscout et DexScreener : au-delà de 10 %, une part de créateur est
+vue comme un risque. Ta part ne peut exister que **bloquée** (`vesting.enabled: true`) ;
+avec `tokenPercent + community.percent` égal à 100, tu ne gardes rien et aucun contrat de
+blocage n'est déployé.
 
-**La réserve communauté** part, elle aussi, **avant** l'ouverture du pool (même commande
-`lock`), vers un wallet **neuf**, dédié et public : annonce son adresse, tout le monde
-peut suivre son solde. Le script refuse le wallet de déploiement, une adresse de contrat,
-nulle ou « morte », et une adresse sans sa casse d'origine. Garde bien sa clé : sans elle,
-la réserve est perdue. Une réserve demande que ta part soit bloquée (`enabled: true`), ou
-que tu ne gardes rien.
+**La réserve communauté** va au Safe communauté à l'ouverture du pool : annonce son
+adresse, tout le monde peut suivre son solde. Le script vérifie sur la chaîne, avant de
+déployer, que c'est un vrai Safe (version officielle, au moins 2 signatures sur 3
+propriétaires, sans module ni garde) dont le wallet de déploiement n'est **pas**
+propriétaire.
 
 ### 2. Les secrets — keystore chiffré de Hardhat
 
@@ -167,36 +197,27 @@ Sans `ROBINHOOD_RPC_URL`, le RPC public de la doc est utilisé
 | # | Commande | Réseau | Ce qui se passe |
 | --- | --- | --- | --- |
 | 1 | `npm test` | local | Tests Solidity (dont fuzzing) et tests du lancement complet |
-| 2 | `npm run deploy:testnet` | testnet | Déploiement réel du token + vérification Blockscout |
-| 3 | `npm run lock:testnet` | testnet | Blocage réel de ta part dans le contrat de vesting + vérification Blockscout |
-| 4 | `npm run rehearsal` | copie locale du mainnet | Lancement complet (token, blocage, pool) avec les vrais contrats Uniswap, plus un achat-revente test |
-| 5 | `npm run deploy:mainnet` | **mainnet** | Déploiement du token + vérification Blockscout |
-| 6 | `npm run lock:mainnet` | **mainnet** | Blocage de ta part dans le contrat de vesting, puis envoi de la réserve communauté à son wallet, **avant** l'ouverture du pool + vérification Blockscout. Enchaîne aussitôt avec l'étape 7 |
-| 7 | `npm run liquidity:mainnet` | **mainnet** | PoolSeeder, puis ouverture du marché en une transaction avec tout le reste, LP brûlées |
-| 8 | `npm run status:mainnet` | mainnet, lecture seule | État du token, de ta part bloquée et du pool |
+| 2 | `npm run rehearsal` | copie locale du mainnet | Lancement complet avec les vrais contrats Uniswap : blocage, courbe, achats, revente, cible atteinte, pool ouvert, achat sur Uniswap |
+| 3 | `npm run deploy:mainnet` | **mainnet** | Contrat de blocage, puis courbe (qui crée le token), + vérification Blockscout des trois |
+| 4 | — | — | Annonce l'heure d'ouverture et l'adresse de la courbe. À `openAt`, les achats s'ouvrent tout seuls ; à la cible, le pool aussi |
+| 5 | `npm run status:mainnet` | mainnet, lecture seule | État de la courbe (ETH réuni, % vendu, prix, limite par wallet), de ta part, de la réserve et du pool |
 | plus tard | `npm run release:mainnet` | mainnet | Après la falaise : verse au bénéficiaire ce qui est libéré |
 
-La répétition (étape 4) avance même le temps, sur sa copie locale, pour montrer la
-libération de ta part à la falaise puis à la fin.
+Il n'y a plus d'étape de blocage ni d'étape de liquidité séparées : le contrat de blocage
+est déployé par la même commande, juste avant la courbe, et c'est la courbe qui le
+remplit et qui ouvre le pool. Ton wallet ne détient jamais de tokens.
 
-Sur le mainnet, chaque script affiche d'abord son plan complet (montants, prix,
-capitalisation, frais estimés). Rien n'est envoyé tant que tu n'as pas **retapé le
-symbole du token** ; toute autre réponse annule.
+La répétition (étape 2) avance le temps sur sa copie locale : ouverture, 24 h de limite,
+cible, puis falaise et fin du blocage. Sans Safe communauté dans la config, elle déploie
+un Safe d'essai 2 sur 3 sur sa copie locale.
 
-**Testnet.** La doc Robinhood Chain ne mentionne pas de faucet. Le testnet est rattaché
-à Sepolia, donc la voie habituelle est d'y faire passer de l'ETH Sepolia par le pont
-Arbitrum. Uniswap v2 n'étant pas référencé sur le testnet, l'ouverture du pool ne s'y fait
-pas : c'est la répétition (étape 4) qui la couvre, sur l'état réel du mainnet. Si tu
-n'obtiens pas d'ETH testnet, l'étape 4 suffit à tout valider sauf la vérification
-Blockscout.
+Sur le mainnet, le script affiche d'abord son plan complet (répartition, prix,
+capitalisations, heure d'ouverture, calendrier du blocage, frais estimés). Rien n'est
+envoyé tant que tu n'as pas **retapé le symbole du token** ; toute autre réponse annule.
 
-**Entre le déploiement et l'ouverture du pool**, ne transfère aucun token à qui que ce
-soit : quelqu'un qui en recevrait pourrait créer des parts LP avant toi, ce qui bloquerait
-l'ouverture (le script le détecte et s'arrête sans rien envoyer). Le contrat de blocage,
-lui, ne peut rien faire de ta part, sauf la verser au bénéficiaire selon le calendrier :
-il ne peut pas ouvrir un pool. C'est pourquoi elle se bloque avant l'ouverture : les
-acheteurs la voient bloquée dès la première seconde, et l'étape de liquidité refuse de
-partir tant que ce n'est pas fait (si le blocage est activé).
+**Testnet.** Uniswap v2 n'est pas référencé sur le testnet de Robinhood Chain, et la
+courbe en a besoin : `npm run deploy:testnet` refuse donc de partir et renvoie vers la
+répétition (étape 2), qui couvre tout le lancement sur l'état réel du mainnet.
 
 **Pendant tout le lancement**, n'utilise ce wallet nulle part ailleurs (pas de MetaMask
 en parallèle) : les scripts gèrent eux-mêmes l'ordre de ses transactions (nonces).
@@ -208,50 +229,29 @@ en parallèle) : les scripts gèrent eux-mêmes l'ordre de ses transactions (non
 **Avant tout envoi**
 - Le réseau est le bon et le RPC répond avec le bon chain ID (4663 mainnet, 46630 testnet).
 - Nom, symbole et offre sont valides ; aucune marque Robinhood ; pas de valeurs d'exemple.
-- Le wallet chargé est celui qui a déployé le token, et ses soldes suffisent. Le plan
-  signale si le wallet a déjà envoyé des transactions (donc s'il n'est pas neuf).
+- Les paramètres de la courbe sont raisonnables et acceptés par le contrat (mêmes
+  formules), l'heure d'ouverture est dans la fenêtre permise.
 - Les adresses Uniswap pointent vers de vrais contrats, et le routeur officiel annonce
   bien la factory et le WETH attendus.
-- Aucune part LP n'existe déjà pour la paire.
-
-**Pendant le blocage de ta part**
-- Le calendrier est vérifié avant tout envoi et affiché avec ses dates. Pour le
-  bénéficiaire, une adresse sans sa casse d'origine (donc sans somme de contrôle pour
-  détecter une faute de frappe), nulle, « morte » ou de contrat est refusée.
-- Le contrat déployé est relu sur la chaîne (bénéficiaire, début, falaise, fin) avant de
-  lui confier quoi que ce soit, puis le transfert est simulé.
-- Le blocage est lu dans le **reçu** : transfert au montant exact, depuis ton wallet,
-  vers le contrat. Le code du contrat est ensuite vérifié sur Blockscout pour que tout le
-  monde puisse lire le calendrier.
-- La réserve communauté suit le même chemin : transfert simulé, signé et noté avant
-  diffusion, lu dans le **reçu** (montant exact, depuis ton wallet, vers le wallet
-  communauté).
-- L'ouverture du pool refuse ensuite de partir tant que ta part n'est pas bloquée (si tu
-  en gardes une avec le blocage activé) ou que la réserve n'est pas envoyée, puis met
-  dans le pool exactement l'offre moins ta part et moins la réserve.
-
-**Pendant l'ouverture du marché**
-- Le PoolSeeder est autorisé pour le montant exact, jamais en illimité. Cette
-  autorisation ne peut servir qu'à ton wallet : le PoolSeeder ne prend des tokens qu'à
-  celui qui l'appelle.
-- L'ouverture est simulée à l'identique avant l'envoi. Si la simulation échoue, rien
-  d'autre n'est envoyé.
-- Tout se passe en une transaction : création de la paire si besoin, dépôt, parts LP
-  vers l'adresse morte. Le WETH déjà présent dans la paire au moment du plan, plus une
-  marge de 1 % de ton ETH, est le maximum accepté (voir *PoolSeeder* plus haut).
+- Le Safe communauté est un vrai Safe 2 sur 3 sans le wallet de déploiement. Le
+  bénéficiaire du blocage est un wallet ordinaire, avec sa casse d'origine, différent du
+  wallet de déploiement sur le mainnet.
+- Le solde couvre les frais. Le plan signale si le wallet a déjà envoyé des transactions
+  (donc s'il n'est pas neuf).
+- Le déploiement de la courbe est **simulé** à l'identique juste avant la signature, et
+  l'heure d'ouverture recontrôlée.
 
 **Après**
-- Le résultat est lu dans le **reçu** de la transaction : toutes les parts LP créées par
-  ce dépôt sont allées à l'adresse morte (plus les 1000 parts que toute paire Uniswap v2
-  verrouille à l'adresse 0). L'état ultérieur du pool, qui peut changer, n'entre pas en
-  compte.
+- La courbe et le token sont relus sur la chaîne (adresse du token, heure d'ouverture,
+  ETH virtuel, cible, nom, symbole, offre) avant de noter le déploiement confirmé.
+- Les codes de la courbe, du token (créé par la courbe) et du contrat de blocage sont
+  vérifiés sur Blockscout : tout le monde peut lire les règles.
 
 **Journal et reprise : jamais de double envoi**
-- Chaque transaction (déploiement du token, contrat de blocage, blocage de ta part,
-  PoolSeeder, autorisation, ouverture du pool) est **signée sur ton ordinateur, puis
+- Chaque transaction (contrat de blocage, courbe) est **signée sur ton ordinateur, puis
   notée** dans `deployments/<réseau>.json` — octets signés et hash compris — **avant**
-  d'être diffusée (écriture atomique). Le hash est donc connu avant que quoi que ce soit
-  parte sur le réseau.
+  d'être diffusée (écriture atomique). Le hash, l'adresse de la courbe et celle du token
+  sont donc connus avant que quoi que ce soit parte sur le réseau.
 - Si un script est interrompu à n'importe quel moment (coupure, erreur RPC, Ctrl-C),
   relance **la même commande**. Pour une transaction notée, elle :
   - cherche son reçu par hash : s'il existe, elle confirme ;
@@ -261,37 +261,39 @@ en parallèle) : les scripts gèrent eux-mêmes l'ordre de ses transactions (non
     **le même nonce** (deux versions ne peuvent pas passer toutes les deux), après une
     nouvelle confirmation sur le mainnet ;
   - ne remet le journal à l'étape précédente que sur la preuve d'un échec : le reçu de
-    *ta* transaction, en échec. Un reçu introuvable, un RPC muet ou en retard ne font
-    jamais rien effacer : le script s'arrête et la relance reprend le suivi.
+    *ta* transaction, en échec (par exemple une courbe diffusée après son heure
+    d'ouverture). Un reçu introuvable, un RPC muet ou en retard ne font jamais rien
+    effacer : le script s'arrête et la relance reprend le suivi.
 - Le nonce de chaque nouvelle transaction n'est jamais inférieur à ce que le journal sait
-  déjà utilisé (`nonceFloor` : transactions réussies, en échec et autorisations) : un RPC
-  public en retard ne peut pas faire réutiliser un nonce.
+  déjà utilisé (`nonceFloor` : transactions réussies et en échec) : un RPC public en
+  retard ne peut pas faire réutiliser un nonce.
 - Un verrou (`deployments/<réseau>.lock`) empêche deux lancements simultanés sur le même
   réseau, par exemple depuis deux terminaux. Un verrou laissé par un script arrêté
   brutalement est repris automatiquement.
+- Si le contrat de blocage est confirmé mais pas la courbe, la relance le réutilise (il
+  est vide) à condition que `curve.openAt` n'ait pas changé : son calendrier commence à
+  cette heure-là.
 
 > **Tant qu'une entrée du journal est `"pending"`, le fichier contient une transaction
 > signée prête à partir.** Ne le publie pas dans cet état (pas de `git push`). Pour
 > abandonner volontairement une entrée `"pending"` : envoie n'importe quelle transaction
 > depuis ce wallet (par exemple 0 ETH à toi-même) — elle prend ce nonce et rend la
 > transaction notée inutilisable — puis retire **seulement cette entrée** du fichier
-> (`"token"`, `"seeder"`, `"approval"`, `"liquidity"`, `"vesting"`, `"lock"` ou `"community"`), en gardant les autres : sans l'entrée du
-> token, l'étape 2 ne saurait plus quel token utiliser. Une fois `"confirmed"`, les
-> octets notés ne peuvent plus servir (nonce consommé).
+> (`"vesting"` ou `"token"`), en gardant les autres. Une fois `"confirmed"`, les octets
+> notés ne peuvent plus servir (nonce consommé).
 
 ---
 
 ## Le jour J : à savoir
 
 - **Snipers.** Le séquenceur traite les transactions dans l'ordre d'arrivée et payer plus
-  de frais ne fait pas passer devant. Des bots achèteront dans les secondes qui suivent
-  l'ouverture. Le contrat n'a volontairement aucun mécanisme anti-bot : il faudrait des
-  fonctions d'administration, que les scanners signalent.
-- **Liquidité.** Peu d'ETH dans le pool = prix très volatil. Le prix et la capitalisation
-  affichés tiennent compte de tout don déjà présent dans la paire, avec une fourchette si
-  une partie peut encore être reprise ; si un tiers ajoute plus que la marge de 1 % après
-  l'affichage, l'ouverture est refusée (voir *PoolSeeder*) plutôt que de partir à un prix
-  plus haut.
+  de frais ne fait pas passer devant. Des bots achèteront dès l'heure d'ouverture : la
+  courbe leur fait payer un vrai prix dès le premier achat et les limite à 0,5 % de
+  l'offre par wallet la première heure (puis 1 %, puis 2 %, jusqu'à 24 h). Un robot peut
+  utiliser plusieurs wallets : la limite rend l'accaparement plus cher, pas impossible.
+- **Rien à faire à l'heure d'ouverture** : les achats s'ouvrent tout seuls, et le pool
+  aussi quand la cible est atteinte (l'acheteur qui l'atteint paie le gas de l'ouverture).
+  `npm run status:mainnet` montre où en est la courbe.
 - **Frais.** Les montants de gas affichés par la répétition sont ceux de l'exécution ; sur
   Robinhood Chain, chaque transaction paie aussi une part « données L1 ».
 - **Après le lancement.** Ajoute logo, description et liens (section suivante). Annonce
@@ -311,11 +313,12 @@ en parallèle) : les scripts gèrent eux-mêmes l'ordre de ses transactions (non
   depuis Blockscout (onglet *Write contract* du contrat de blocage, fonction
   `release(address token)` avec l'adresse du token), avec n'importe quel wallet.
 - **Le bénéficiaire** : garde précieusement sa clé. Sans elle, les tokens libérés arrivent
-  sur une adresse que plus personne ne contrôle. Par défaut, c'est le wallet de
-  déploiement : sa clé est dans le keystore de Hardhat, sur ton ordinateur. Sauvegarde-la
-  aussi ailleurs (gestionnaire de mots de passe, papier en lieu sûr) : tu en auras besoin
-  pendant toute la durée du blocage. Le bénéficiaire peut transmettre son rôle à une autre
+  sur une adresse que plus personne ne contrôle. Sur le mainnet, c'est obligatoirement ton
+  wallet fondateur (Ledger), jamais le wallet de déploiement : tu en auras besoin pendant
+  toute la durée du blocage. Le bénéficiaire peut transmettre son rôle à une autre
   adresse (`transferOwnership` sur Blockscout), jamais le calendrier.
+- **Avant l'ouverture du pool**, le contrat de blocage est vide : ta part est encore dans
+  la courbe, qui la lui verse à la cible. Si la cible n'est jamais atteinte, elle y reste.
 - **Vendre ta part libérée** se fait dans le même pool que tout le monde : vends
   progressivement et en toute transparence. À la revente, c'est imposable (gain en capital
   ou revenu d'entreprise selon ton activité).
@@ -339,8 +342,8 @@ après le déploiement, sur les sites qui affichent le token. Rien à coder.
 - **Un site** (une page suffit) et un compte X ; Telegram si tu animes une communauté.
 
 **Blockscout (gratuit)** — l'explorateur officiel de la chaîne :
-1. Le code du token doit être vérifié : l'étape 1 s'en charge (sinon, relance la
-   commande qu'elle affiche).
+1. Le code du token doit être vérifié : le déploiement s'en charge (sinon, relance la
+   commande qu'il affiche).
 2. Connecte-toi sur <https://robinhoodchain.blockscout.com> avec le **wallet de
    déploiement**. Une fois le pool ouvert, tu peux importer sa clé dans MetaMask pour
    ça — pas avant : pendant le lancement, ce wallet ne sert qu'aux scripts.
@@ -369,8 +372,9 @@ agrégateurs, plus tard, quand le token a du volume. Rien à faire au lancement.
 | WETH | `0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73` | `@uniswap/sdk-core` 7.19.4 et doc Robinhood Chain |
 
 Elles sont dans `scripts/lib/networks.ts` et revérifiées sur la chaîne à chaque lancement.
-Le routeur ne sert qu'à ce contrôle et aux achats-reventes de la répétition. L'adresse du
-PoolSeeder que tu déploies est notée dans `deployments/robinhood.json`.
+Le routeur ne sert qu'à ce contrôle et aux achats de la répétition. Les adresses de la
+courbe, du token, de la paire et du contrat de blocage sont notées dans
+`deployments/robinhood.json`.
 
 Explorateurs : <https://robinhoodchain.blockscout.com> (mainnet) et
 <https://explorer.testnet.chain.robinhood.com> (testnet).
@@ -379,14 +383,14 @@ Explorateurs : <https://robinhoodchain.blockscout.com> (mainnet) et
 
 ## Vérification du code sur Blockscout
 
-Les scripts la tentent automatiquement : le token au déploiement (5 essais, Blockscout met
-quelques secondes à indexer), le contrat de blocage à la fin du blocage, le PoolSeeder à
-la fin de l'ouverture du pool. En cas d'échec, le
-script affiche la commande exacte à relancer, du type :
+Le déploiement la tente automatiquement pour la courbe, le token (créé par la courbe,
+avec ses propres arguments) et le contrat de blocage (3 essais chacun, Blockscout met
+quelques secondes à indexer). En cas d'échec, le script affiche la commande exacte à
+relancer, du type :
 
 ```bash
-npx hardhat verify blockscout --network robinhood 0xADRESSE_TOKEN "Nom" "SYMBOLE" 1000000000
-npx hardhat verify blockscout --network robinhood 0xADRESSE_SEEDER 0xFACTORY 0xWETH
+npx hardhat verify blockscout --network robinhood 0xADRESSE_COURBE "Nom" "SYMBOLE" '["1000000000","0xBLOCAGE",…]'
+npx hardhat verify blockscout --network robinhood 0xADRESSE_TOKEN "Nom" "SYMBOLE" 1000000000 0xFACTORY 0xWETH
 npx hardhat verify blockscout --network robinhood 0xADRESSE_BLOCAGE 0xBENEFICIAIRE DEBUT DUREE FALAISE
 ```
 
@@ -399,6 +403,12 @@ bytecode déployé correspond toujours à celui que Blockscout recompile.
 
 - `contracts/MemeToken.t.sol` : tests unitaires et de fuzzing (offre, borne uint112,
   transferts au montant exact, autorisations, refus de l'ETH).
+- `contracts/LaunchCurve.t.sol` : paramètres, prix, achats, reventes, limites anti-bot,
+  ouverture du pool (prix continu, dons, blocage de la paire), part et réserve versées à
+  la cible, réentrance, fuzzing des invariants (la courbe ne doit jamais plus d'ETH
+  qu'elle n'en a, aucun aller-retour gagnant).
+- `test/curve.ts` : la courbe contre le vrai bytecode Uniswap v2 (ouverture au prix de fin
+  de courbe, LP brûlées, snipers limités sur Uniswap, paire piégée d'avance).
 - `contracts/TokenVesting.t.sol` : calendrier du blocage (rien avant la falaise,
   libération linéaire, tout à la fin), versement toujours au bénéficiaire quel que soit
   l'appelant, `renounceOwnership` désactivée ; fuzzing du montant libéré (jamais en
@@ -430,33 +440,30 @@ bytecode déployé correspond toujours à celui que Blockscout recompile.
   les rounds du flux d'essai, `startRun`, `submit` d'une partie complète).
 - `test/nft.ts` : paramètres des cartes, déploiement journalisé, mint, révélation et JSON
   des métadonnées décodé.
-- `test/guards.ts` : surface des contrats (exactement les 9 fonctions ERC-20 pour le
-  token ; une seule fonction d'écriture pour le PoolSeeder), garde-fous des paramètres,
-  journal et verrou, calculs du plan, formats d'affichage.
+- `test/guards.ts` : surface des contrats (les 9 fonctions ERC-20 plus la lecture de
+  l'anti-bot pour le token ; seulement `buy` et `sell` en écriture pour la courbe),
+  garde-fous des paramètres (courbe, heure d'ouverture, réserve, blocage), répartition de
+  l'offre et chiffres de la courbe, journal et verrou, formats d'affichage.
 - `test/launch-flow.ts` : le lancement complet contre le **vrai bytecode Uniswap v2**
   (artefacts npm officiels), avec les mêmes fonctions que les scripts :
-  - ouverture du pool, LP toutes brûlées, rien ne reste dans le PoolSeeder ;
-  - pool non bloqué par un don de WETH, synchronisé ou non (le test montre aussi que ce
-    même état bloque bien le routeur officiel) ; don connu au moment du plan accepté,
-    don de 1 wei de dernière seconde accepté (marge), gros don arrivé après le plan
-    refusé ; WETH verrouillé distingué du WETH reprenable ;
-  - refus quand des parts LP existent déjà ;
-  - reprises après interruption : transaction signée mais jamais diffusée (déploiement,
-    autorisation, ouverture), réponse du RPC perdue, transaction encore en attente, RPC
+  - déploiement de la courbe : adresses de la courbe et du token prévues avant diffusion,
+    100 % de l'offre dans la courbe, chiffres du plan identiques aux vues du contrat, pas
+    de second déploiement ; refus d'une heure d'ouverture passée, imminente ou à plus de
+    30 jours, et d'un contrat de blocage ou d'un Safe sans code, sans rien envoyer ;
+  - ouverture du pool à la cible, au prix de fin de courbe, LP toutes brûlées ;
+  - reprises après interruption : transaction signée mais jamais diffusée (courbe,
+    contrat de blocage), réponse du RPC perdue, transaction encore en attente, RPC
     muet, nonce pris par une autre transaction, frais devenus trop bas (re-signature au
     même nonce), version précédente minée après une re-signature, solde insuffisant au
-    moment de diffuser, RPC en retard sur le nonce ou sur les lectures ;
-  - échec définitif : seul le reçu en échec de ta transaction remet le journal en arrière,
-    et son nonce reste compté ;
-  - blocage de ta part avant l'ouverture : montant exact lu dans le reçu, pool ouvert
-    ensuite avec tout le reste, rien ne sort du contrat avant la falaise (pas même pour
-    ouvrir un pool), libération dans le temps (falaise puis fin), personne ne peut
-    retirer plus tôt, reprises (contrat noté mais jamais diffusé, réponse perdue, RPC
-    muet), échec miné, répétition complète avec blocage ;
-  - réserve communauté : part bloquée puis réserve envoyée, pool avec exactement le reste
-    (montants lus dans les reçus), ouverture refusée tant que la réserve n'est pas
-    envoyée, reprises (réponse perdue, RPC muet), échec miné, répétition complète ;
-  - achat puis revente par un autre compte.
+    moment de diffuser, RPC en retard sur le nonce ;
+  - échec définitif (courbe diffusée après son heure d'ouverture) : seul le reçu en échec
+    de ta transaction remet le journal en arrière, et son nonce reste compté ;
+  - blocage et réserve : contrat de blocage déployé avant la courbe, tout reste dans la
+    courbe jusqu'à la cible, puis ta part au blocage et la réserve au Safe aux montants
+    exacts ; cible jamais atteinte : rien ne sort ; libération dans le temps (falaise
+    puis fin), personne ne peut retirer plus tôt ;
+  - répétitions complètes (sans part, avec blocage et Safe d'essai) ;
+  - achat puis revente sur Uniswap après l'ouverture, sans taxe.
 
 ```bash
 npm test               # tout
@@ -480,7 +487,7 @@ promesse**, et rien ne va dans le pool du token. À déployer 2 à 4 semaines ap
 | Répartition de chaque mint | 30 % fondateurs, 30 % fondation, le reste (40 %) communauté, dans les cagnottes de la **période de 30 jours** en cours |
 | Versements (mode pull) | **rien avant la fin d'une période** ; ensuite n'importe qui la clôture (`closeRounds(max)`, dans l'ordre) : les parts sont **créditées** en soldes dus (`owed(adresse)`) aux adresses fixées au déploiement et à la fondation gagnante. Puis n'importe qui déclenche `withdraw(destinataire)`, qui n'envoie qu'à ce destinataire son dû. S'il refuse l'ETH, la transaction réussit, son solde reste crédité (`WithdrawFailed`) et personne d'autre n'est bloqué. Événements : `RoundClosed`, `Credited`, `CharityReleased`, `Withdrawn`… (traçables sur Blockscout) |
 | Vote de la fondation | à chaque période, 1 carte = 1 voix (une carte revote à chaque période) ; la cagnotte fondation de la période va au gagnant ; égalité → le plus petit index ; sans aucune voix, elle est reportée sur la période en cours |
-| Nouvelles fondations | un détenteur propose (`propose`) avec un **dépôt de 0,005 ETH**, un nom (40 octets), la description (280) et le lien `https://` (200 octets) de la **page officielle de dons qui affiche l'adresse** ; **snapshot** : seules les cartes n° 1 à `totalMinted` au moment de la proposition votent, oui ou non, une fois chacune, pendant **7 jours pleins** (indépendants des périodes) ; ensuite n'importe qui finalise : approuvée si oui ≥ 2/3 des voix exprimées **et** oui + non ≥ quorum = max(25, 5 % des cartes du snapshot, arrondi au-dessus). Approuvée : candidate dès la période suivante, dépôt rendu (crédité). Refusée : dépôt versé à la cagnotte communauté de la période en cours. **3 approbations au plus par période** et 20 fondations actives au plus : au-delà, la proposition finit « sans place » (`FULL`), dépôt rendu, et elle peut être reproposée. Une fondation approuvée qui ne gagne **aucune période pendant 6 périodes de suite** expire et libère sa place (les fondations de départ n'expirent pas). Une seule proposition ouverte par wallet de fondation ; le dépôt remplace l'ancienne limite d'une proposition par adresse et par période |
+| Nouvelles fondations | un détenteur propose (`propose`) avec un **dépôt de 0,005 ETH**, un nom (40 octets), la description (280) et le lien `https://` (200 octets) de la **page officielle de dons qui affiche l'adresse** ; **snapshot** : seules les cartes n° 1 à `totalMinted` au moment de la proposition votent, oui ou non, une fois chacune, pendant **7 jours pleins** (indépendants des périodes) ; ensuite n'importe qui finalise : approuvée si oui ≥ 2/3 des voix exprimées **et** oui + non ≥ quorum = max(25, 10 % des cartes du snapshot, arrondi au-dessus). Approuvée : candidate dès la période suivante, dépôt rendu (crédité). Refusée : dépôt versé à la cagnotte communauté de la période en cours. **3 approbations au plus par période** et 20 fondations actives au plus : au-delà, la proposition finit « sans place » (`FULL`), dépôt rendu, et elle peut être reproposée. Une fondation approuvée qui ne gagne **aucune période pendant 6 périodes de suite** expire et libère sa place (les fondations de départ n'expirent pas). Une seule proposition ouverte par wallet de fondation ; le dépôt remplace l'ancienne limite d'une proposition par adresse et par période |
 | Édition Trophée (réserve) | les 111 cartes de réserve sont des prix de concours gratuits, frappés par le wallet communauté (`mintTrophy(to, nom, humeur, élément, nombre)`, une par appel) : **une seule par wallet à vie** (`trophyReceived`), seulement pour un wallet qui détient **2 cartes ou moins** au moment du mint, jamais pour le wallet communauté. Tirage à part : sans l'option la plus commune de chaque attribut (sans les deux plus communes pour le cadre et les joues), donc au moins « épique » sur le site (top 3,6 % au pire, aussi pour une carte Plain) ; l'option plancher pèse 8 fois plus, sauf « jackpot » (premier octet de la graine < 23, ≈ 9 %) où les poids restent normaux. Résultat visé et simulé : ≈ 70 % épiques, 25 % légendaires, 5 % mythiques (≈ 6 sur 111). Paliers du site, sur le score des cartes achetées : épique top 5 %, légendaire top 1 %, **mythique top 0,1 %** (≈ 3 à 4 cartes achetées sur 3 222). Les tirages des cartes achetées ne changent pas. `cardOf` renvoie `trophy`, et le JSON porte l'attribut `edition: trophy`. **Une carte Trophée ne vote jamais** (ni période, ni propositions, même transférée) ; le wallet communauté ne vote pas et ne propose pas |
 | Métadonnées | JSON entièrement sur la chaîne (`tokenURI`), image `<imageBaseURI><numéro>.png`, page `<viewerURI>?id=<numéro>` |
 
@@ -523,6 +530,16 @@ npm run nft:deploy:mainnet   # plan, puis retape le symbole du token
 Même mécanique que les autres étapes : transaction notée dans le journal (entrée `"nft"`)
 avant sa diffusion, reprise sans doublon, vérification Blockscout. Mets ensuite l'adresse
 affichée dans la `CONFIG` du site.
+
+Pendant la vente, laisse tourner le robot de révélation sur ton PC :
+
+```bash
+npm run nft:reveal:mainnet   # toutes les 5 min, révèle les cartes prêtes (Ctrl+C pour arrêter)
+```
+
+Une carte non révélée dans les 256 blocs qui suivent son bloc cible reste « Plain » pour
+toujours (une carte Trophée tombe au plancher épique). Les mints et le site en révèlent déjà ;
+le robot couvre une page fermée ou une période creuse. Il ne paie que le gas de `revealMany`.
 
 Avant le mainnet : un avocat (statut des cartes, vote, dons) et un comptable (revenus de
 mint). Vérifie aussi qu'un marché NFT accepte Robinhood Chain : sinon, les cartes se voient
@@ -567,6 +584,13 @@ toi) ne peut changer une baisse ni effacer un résultat.
   `startRun` ne lit aucun prix (il marche pendant une panne du flux) : il exige seulement que
   les prix couvrent la course (`finishDay + 15` enregistré), sinon `DataBehind` — le site
   appelle alors `recordDay` d'abord (en pratique au début de chaque trimestre).
+  **Flux de secours** (`game.backupFeed`, facultatif, figé au déploiement) : si le flux principal
+  n'a rien publié depuis 2 jours, `recordDayBackup` enregistre les jours avec le secours, mêmes
+  vérifications. **Mode dégradé** : si, 14 jours après le début d'un trimestre, les prix ne
+  couvrent toujours pas sa course, le concours se joue sur ce qui est connu (arrivée au dernier
+  jour évaluable, `lastRecordedDay − 15`), figée au premier départ (`ContestFrozen`) et pour
+  toujours pour ce concours. Le jeu ne se bloque donc jamais, même si Chainlink retire son flux.
+  Le jeu est **pour le plaisir, sans prix** : une partie parfaite se calcule d'avance.
   `submit(touches, pseudo)` refuse une partie plus rapide que le vrai jeu (`TooFast`, temps
   minimal `minTimeFor` : table historique, puis cumul jour par jour calculé par la chaîne),
   plus vieille que 3 heures (`RunExpired`) ou sans départ (`NoRun`).
@@ -626,7 +650,8 @@ quel ERC-20 standard, sans owner. L'offre tient déjà dans un u128.
 contracts/
   MemeToken.sol          le token
   MemeToken.t.sol        tests Solidity (unitaires + fuzzing)
-  PoolSeeder.sol         ouverture atomique du pool Uniswap v2, LP brûlées
+  LaunchCurve.sol        courbe de lancement : crée le token, vend, ouvre le pool, LP brûlées
+  LaunchCurve.t.sol      tests Solidity de la courbe
   TokenVesting.sol       blocage de ta part (VestingWalletCliff d'OpenZeppelin)
   TokenVesting.t.sol     tests Solidity du blocage
   DipDuckCards.sol       cartes de collection NFT (après le lancement)
@@ -636,9 +661,7 @@ contracts/
   mocks/MockAggregator.sol flux de prix d'essai (tests uniquement)
 scripts/
   00-rehearsal-fork.ts   répétition générale sur copie locale du mainnet
-  01-deploy.ts           déploiement du token + vérification Blockscout
-  02-lock.ts             blocage de ta part (vesting), avant le pool + vérification Blockscout
-  03-add-liquidity.ts    PoolSeeder + ouverture du marché
+  01-deploy.ts           contrat de blocage puis courbe (qui crée le token) + vérification Blockscout
   04-status.ts           état du lancement (lecture seule)
   05-release.ts          versement de ta part libérée au bénéficiaire
   06-deploy-nft.ts       déploiement des cartes NFT + vérification Blockscout
@@ -665,23 +688,19 @@ hardhat.config.ts        réseaux, compilateur, Blockscout
 | « Solde ETH insuffisant pour diffuser » | Ajoute de l'ETH au wallet et relance : la même transaction sera diffusée. |
 | « Le nonce N est déjà utilisé » | Souvent un RPC en retard de quelques secondes : relance. Si le message persiste, ce wallet a envoyé une autre transaction avec ce nonce (utilisé ailleurs pendant le lancement). Vérifie sur l'explorateur que le hash noté dans le journal (et ceux de `replacedTxHashes`) n'existe pas, puis retire seulement l'entrée `"pending"` concernée et relance. |
 | « … a échoué » (avec un hash) | Le reçu de ta transaction montre un échec : rien n'a bougé hors frais, le journal est revenu à l'étape précédente. Relance pour voir le nouveau plan. |
-| « WETH donné par un tiers » | Un don de plus de 1 % de ton ETH est arrivé dans la paire après ton plan. Relance : le nouveau plan l'inclut (prix et capitalisation plus hauts) et te redemande ta confirmation. |
 | « Un autre lancement est en cours » | Un autre terminal exécute déjà un script sur ce réseau : attends qu'il se termine. Si ce n'est pas le cas, supprime le fichier `.lock` indiqué. |
 | « Erreur inattendue » | Le message résume l'erreur ; les détails techniques suivent. Le journal n'a pas été abîmé : relance la même commande. |
-| « des parts LP existent déjà » | Quelqu'un a ouvert un pool avec des tokens venus de ton wallet. Rien n'a été envoyé. |
-| « Bloque d'abord ta part » (étape de liquidité) | Lance `npm run lock:mainnet` : ta part se bloque avant l'ouverture du pool. Relance ensuite la liquidité. |
-| « Une ouverture de pool est notée mais pas encore confirmée » (étape de blocage) | Relance d'abord `npm run liquidity:mainnet` pour reprendre son suivi. |
-| « Rien à bloquer » | `tokenPercent` vaut 100 (tu ne gardes rien), ou tes tokens ont déjà quitté ce wallet. |
-| « Ta part est déjà bloquée » | C'est fait : `npm run status:mainnet` montre le contrat et son calendrier. |
-| « Envoie d'abord la réserve communauté » (étape de liquidité) | Lance `npm run lock:mainnet` : il n'envoie que la réserve si ta part est déjà bloquée. Relance ensuite la liquidité. |
-| « community.beneficiary est obligatoire » | Crée un wallet neuf pour la communauté et colle son adresse (avec sa casse d'origine) dans `community.beneficiary`, ou mets `community.percent: 0`. |
-| « Une réserve communauté demande que ta part soit bloquée » | Mets `vesting.enabled: true`, ou règle `tokenPercent + community.percent` à 100 (tu ne gardes rien). |
-| « Le wallet communauté … est un contrat » | Choisis un wallet ordinaire dont tu as la clé. |
+| « curve.openAt est obligatoire » / « déjà passée » / « trop proche » / « plus de 30 jours » | Mets dans `curve.openAt` une date ISO en UTC entre 1 h et 30 jours après maintenant. |
+| « L'heure d'ouverture des achats … est passée ou imminente » | Le temps a passé depuis le plan : choisis une nouvelle heure et relance. Rien n'a été envoyé. |
+| « Le contrat de blocage déjà déployé … commence le … » | Remets dans `curve.openAt` l'heure de la première exécution, ou retire seulement l'entrée `"vesting"` du journal (ce contrat est vide) pour en déployer un neuf. |
+| « Ta part … ne peut exister que bloquée » | Mets `vesting.enabled: true`, ou règle `curve.tokenPercent + community.percent` à 100. |
+| « … n'est pas un Safe valide » | Crée le Safe communauté sur app.safe.global (2 signatures sur 3 propriétaires, sans le wallet de déploiement) et colle son adresse dans `community.beneficiary`. |
+| « La simulation du déploiement de la courbe a échoué » | Le message donne la raison ; rien n'a été envoyé. |
+| « La courbe de lancement a besoin d'Uniswap v2 » (testnet) | Répète le lancement sur la copie locale du mainnet : `npm run rehearsal`. |
+| « Le token est déjà lancé sur ce réseau » | C'est fait : `npm run status:mainnet` montre où en est la courbe. |
 | « Rien à libérer avant la falaise » | Le calendrier ne libère rien avant cette date : relance `npm run release:mainnet` après. |
-| « doit être recopiée avec ses majuscules et minuscules d'origine » | Copie l'adresse du bénéficiaire depuis ton wallet, telle quelle (c'est ce qui permet de détecter une faute de frappe), ou laisse `beneficiary` vide pour utiliser le wallet de déploiement. |
-| « Le bénéficiaire … est un contrat » | Choisis l'adresse d'un wallet ordinaire dont tu as la clé, ou laisse `beneficiary` vide. |
-| « Contrat de blocage déployé, mais vide » | Ta config ne demande plus de bloquer (blocage désactivé ou `tokenPercent: 100`) : passe à l'ouverture du pool. |
-| « la falaise est passée » (ouverture du pool) | Tu as attendu plus longtemps que la falaise entre blocage et pool : les tokens déjà libérés restent dans ton wallet, hors du pool. Le pool reçoit exactement l'offre moins ta part. |
+| « doit être recopiée avec ses majuscules et minuscules d'origine » | Copie l'adresse du bénéficiaire depuis ton wallet, telle quelle (c'est ce qui permet de détecter une faute de frappe), ou laisse `vesting.beneficiary` vide (hors mainnet seulement) pour utiliser le wallet de déploiement. |
+| « Le bénéficiaire … est un contrat » | Choisis l'adresse d'un wallet ordinaire dont tu as la clé (ton Ledger fondateur). |
 | Vérification Blockscout échouée | Relance la commande `npx hardhat verify blockscout …` affichée par le script. |
 | La répétition est lente ou échoue (« missing trie node », limite de débit) | La copie d'état demande un nœud complet : mets une URL Alchemy (archive) dans `ROBINHOOD_RPC_URL`. |
 | La répétition ne démarre pas (erreur de décodage d'un bloc ou d'une transaction Arbitrum) | Le simulateur n'arrive pas à copier l'état de cette chaîne. `npm test` couvre déjà tout le lancement contre le vrai bytecode Uniswap v2 ; essaie une URL Alchemy, sinon passe cette étape. |

@@ -16,7 +16,7 @@
  * jamais déployer deux fois. Sur le mainnet, rien n'est envoyé tant que tu n'as pas retapé
  * le symbole du token.
  */
-import { getAddress, isAddress } from "ethers";
+import { ZeroAddress, getAddress, isAddress } from "ethers";
 import hre from "hardhat";
 import type { NetworkConnection } from "hardhat/types/network";
 
@@ -52,6 +52,15 @@ function feedFor(profile: NetworkProfile): string {
   return getAddress(value.trim());
 }
 
+/** Flux de secours facultatif (mainnet seulement) : adresse 0 si vide. */
+function backupFeedFor(profile: NetworkProfile, feed: string): string {
+  const value: string = profile.isMainnet ? launchConfig.game.backupFeed.trim() : "";
+  if (value === "") return ZeroAddress;
+  if (!isAddress(value)) throw new LaunchError("game.backupFeed n'est pas une adresse valide. Rien n'a été envoyé.");
+  if (getAddress(value) === feed) throw new LaunchError("game.backupFeed doit être différent de game.feed. Rien n'a été envoyé.");
+  return getAddress(value);
+}
+
 async function deployGame(connection: NetworkConnection, profile: NetworkProfile): Promise<void> {
   const { ethers, networkName } = connection;
   const journal = fileJournal(networkName);
@@ -61,11 +70,6 @@ async function deployGame(connection: NetworkConnection, profile: NetworkProfile
   const others: (JournaledTx | undefined)[] = [
     record?.token,
     record?.vesting,
-    record?.lock,
-    record?.community,
-    record?.seeder,
-    record?.approval,
-    record?.liquidity,
     record?.nft,
   ];
   if (others.some((entry) => entry?.status === "pending")) {
@@ -78,6 +82,7 @@ async function deployGame(connection: NetworkConnection, profile: NetworkProfile
   // Genèse et flux validés avant toute signature (même en reprise : le journal doit correspondre).
   const genesis = await loadGenesisFile(launchConfig.game.genesisFile);
   const feed = feedFor(profile);
+  const backupFeed = backupFeedFor(profile, feed);
 
   const [signer] = await ethers.getSigners();
   const wallet = await localWallet(connection);
@@ -105,6 +110,13 @@ async function deployGame(connection: NetworkConnection, profile: NetworkProfile
     row("Dernier prix fourni", `${formatDay(genesis.detectFrom + 13)} : ${Number(genesis.recentPrices.at(-1)) / 1e8} USD`);
     row("Temps minimal", `${genesis.histMinSeconds.length} tranches, ${genesis.histMinSeconds.at(-1)} s au dernier jour fourni`);
     row("Flux BTC/USD", `${feed} — ${Number(price) / 1e8} USD, il y a ${ageSeconds} s`);
+    if (backupFeed === ZeroAddress) {
+      row("Flux de secours", "aucun (mode dégradé seulement si le flux s'arrête)");
+    } else {
+      const backup = await checkFeed(ctx, backupFeed);
+      row("Flux de secours", `${backupFeed} — ${Number(backup.price) / 1e8} USD, utilisé si le principal est muet plus de 2 jours`);
+    }
+    row("Mode dégradé", "prix en retard 14 jours après le début d'un trimestre : course figée sur ce qui est connu");
     if (ageSeconds > GAME_MAX_STALE_SECONDS) {
       console.log("  ⚠ Ce prix a plus de 26 h : recordDay attendra un nouveau round (startRun, lui, ne lit aucun prix).");
     }
@@ -117,7 +129,7 @@ async function deployGame(connection: NetworkConnection, profile: NetworkProfile
     console.log("");
   }
   // Reprise (ou contrat déjà confirmé) : seul le journal fait foi.
-  await deployGameStep(ctx, genesis, feed);
+  await deployGameStep(ctx, genesis, feed, backupFeed);
 
   const game = (await journal.read())?.game;
   if (game === undefined) throw new LaunchError("Journal incohérent : le jeu a disparu du journal.");

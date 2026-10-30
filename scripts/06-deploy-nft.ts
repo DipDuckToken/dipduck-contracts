@@ -38,11 +38,6 @@ async function deployNft(connection: NetworkConnection, profile: NetworkProfile)
   }
   const others: (JournaledTx | undefined)[] = [
     record.vesting,
-    record.lock,
-    record.community,
-    record.seeder,
-    record.approval,
-    record.liquidity,
     record.game,
   ];
   if (others.some((entry) => entry?.status === "pending")) {
@@ -107,7 +102,7 @@ async function deployNft(connection: NetworkConnection, profile: NetworkProfile)
         `${name} — ${plan.candidateWallets[i]}${plan.candidateUrls[i] ? ` — ${plan.candidateUrls[i]}` : ""}`,
       ),
     );
-    row("Nouvelles fondations", "proposées par les détenteurs, approuvées par vote (quorum 10 voix), 20 au maximum");
+    row("Nouvelles fondations", "proposées par les détenteurs, approuvées par vote (quorum : 25 voix ou 10 % des cartes), 20 au maximum");
     row("Images", `${plan.imageBaseURI}<numéro>.png`);
     row("Page d'une carte", `${plan.viewerURI}?id=<numéro>`);
     row("Hasard", "pseudo-aléatoire, non certifié (pas de VRF sur la chaîne) : acceptable pour des objets sans valeur");

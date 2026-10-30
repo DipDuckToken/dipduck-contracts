@@ -150,6 +150,19 @@ contract MemeTokenTest {
         require(token.launchedAt() == 1_000_000, "ouverture inchangee");
     }
 
+    function test_OnlyLauncherOpensThePool() public {
+        (MemeToken token, address pair) = _launch();
+        require(token.LAUNCHER() == address(this), "lanceur = deployeur");
+        require(token.transfer(BOT, 1000), "envoi avant ouverture");
+        vm.prank(BOT);
+        vm.expectRevert(abi.encodeWithSelector(MemeToken.PoolNotOpen.selector));
+        token.transfer(pair, 1000);
+        require(token.launchedAt() == 0, "toujours ferme");
+        require(token.transfer(pair, 1), "le lanceur ouvre");
+        vm.prank(BOT);
+        require(token.transfer(pair, 1000), "ensuite tout le monde");
+    }
+
     function test_LimitStepsThenDisappears() public {
         (MemeToken token, address pair) = _launch();
         vm.warp(1_000_000);

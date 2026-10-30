@@ -28,12 +28,20 @@ interface IUniswapV2PairFactory {
 ///      Avec `factory` = 0 (testnet sans Uniswap, tests), il n'y a pas de paire :
 ///      la limite ne s'active jamais.
 ///
+///      Ouverture réservée : avant l'ouverture, seul LAUNCHER (le contrat qui a
+///      déployé le token, normalement la courbe de lancement) peut envoyer des
+///      tokens à la paire. Personne ne peut donc ajouter de liquidité à la paire
+///      avant la courbe, ni fixer le prix de départ du pool à sa place.
+///
 ///      L'offre, exprimée en unités de base (18 décimales), est bornée à
 ///      type(uint112).max : c'est la taille des réserves d'une paire Uniswap v2,
 ///      donc toute l'offre peut entrer dans le pool et en ressortir. Cette borne
 ///      tient aussi dans un uint128 (CW20 en Uint128, Balance Substrate en u128)
 ///      si le token est un jour ponté par verrouillage (lock-and-mint).
 contract MemeToken is ERC20 {
+    /// @dev Adresse morte : les tokens qu'on y envoie sont brûlés, sans limite.
+    address private constant DEAD = 0x000000000000000000000000000000000000dEaD;
+
     /// @dev 10^18 : une unité entière du token en unités de base.
     uint256 private constant UNIT = 1e18;
 
@@ -47,6 +55,9 @@ contract MemeToken is ERC20 {
     /// @notice Paire Uniswap v2 TOKEN/WETH (0 si aucune factory n'a été donnée).
     address public immutable PAIR;
 
+    /// @notice Seule adresse qui peut ouvrir le pool : celle qui a déployé le token.
+    address public immutable LAUNCHER;
+
     /// @notice Heure d'ouverture du pool (0 tant qu'il n'est pas ouvert).
     uint256 public launchedAt;
 
@@ -56,6 +67,9 @@ contract MemeToken is ERC20 {
 
     /// @notice Le destinataire détiendrait plus que la limite anti-bot du moment.
     error WalletLimit(uint256 limit);
+
+    /// @notice Envoi vers la paire avant son ouverture, par une autre adresse que LAUNCHER.
+    error PoolNotOpen();
 
     /// @notice Le pool vient d'être ouvert : la limite anti-bot démarre.
     event Launched(uint256 timestamp);
@@ -74,10 +88,11 @@ contract MemeToken is ERC20 {
         }
         if (factory != address(0)) {
             // Une paire créée d'avance par un tiers (l'adresse du token est prévisible)
-            // est simplement reprise : elle est vide, PoolSeeder gère les dons.
+            // est simplement reprise : elle est vide, et la courbe (LAUNCHER) gère les dons.
             address pair = IUniswapV2PairFactory(factory).getPair(address(this), weth);
             PAIR = pair != address(0) ? pair : IUniswapV2PairFactory(factory).createPair(address(this), weth);
         }
+        LAUNCHER = msg.sender;
         _mint(msg.sender, wholeTokens * UNIT);
     }
 
@@ -98,12 +113,13 @@ contract MemeToken is ERC20 {
         super._update(from, to, value);
         if (to == PAIR) {
             if (launchedAt == 0 && to != address(0)) {
+                if (from != LAUNCHER) revert PoolNotOpen();
                 launchedAt = block.timestamp;
                 emit Launched(block.timestamp);
             }
             return;
         }
         uint256 limit = walletLimit();
-        if (to != address(0) && balanceOf(to) > limit) revert WalletLimit(limit);
+        if (to != address(0) && to != DEAD && balanceOf(to) > limit) revert WalletLimit(limit);
     }
 }

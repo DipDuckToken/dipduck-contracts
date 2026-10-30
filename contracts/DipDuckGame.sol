@@ -41,6 +41,12 @@ interface IAggregatorV3 {
 ///      d'agrégateur juste après r. Tant qu'aucun round suivant n'existe, le jour est refusé
 ///      (DayNotFinal) : un seul round convient pour chaque jour, l'appelant ne choisit rien.
 ///      Une panne du flux ne bloque pas le jeu : `startRun` ne lit aucun prix.
+///      Flux de secours (facultatif, BACKUP_FEED) : si le flux principal ne publie plus rien depuis
+///      STALE_AFTER, `recordDayBackup` enregistre les jours avec le flux de secours, mêmes règles.
+///      Mode dégradé : si, FREEZE_AFTER après le début d'un trimestre, les prix ne couvrent toujours
+///      pas sa course, le concours se joue sur ce qui est connu : sa ligne d'arrivée est ramenée au
+///      dernier jour évaluable (lastRecordedDay − 15), figée au premier départ et pour toujours
+///      pour ce concours, même si les prix reviennent ensuite. Le jeu ne se bloque donc jamais.
 ///
 ///      Données : baisses historiques et table des temps minimaux historiques dans le code d'un
 ///      petit contrat de données créé par le constructeur (premier octet 0x00 = STOP, rien
@@ -98,6 +104,10 @@ contract DipDuckGame {
     /// @notice Jours enregistrés au plus par appel de `recordDay` (gas borné) ; le retard
     ///         restant est rattrapé par les appels suivants.
     uint256 public constant MAX_DAYS_PER_CALL = 60;
+    /// @notice Flux principal muet depuis plus longtemps : le flux de secours est permis.
+    uint256 public constant STALE_AFTER = 2 days;
+    /// @notice Délai après le début d'un trimestre avant le mode dégradé (course figée).
+    uint256 public constant FREEZE_AFTER = 14 days;
 
     /// @dev Au plus 1 500 touches par partie.
     uint256 private constant MAX_TAPS = 1500;
@@ -119,6 +129,8 @@ contract DipDuckGame {
 
     /// @notice Flux Chainlink BTC/USD (8 décimales).
     address public immutable FEED;
+    /// @notice Flux BTC/USD de secours (8 décimales), même interface ; 0 = aucun.
+    address public immutable BACKUP_FEED;
     /// @notice Premier jour évalué par la chaîne ; toutes les baisses historiques sont avant.
     uint32 public immutable DETECT_FROM;
     /// @dev Contrat de données : 0x00, 3 octets par baisse historique, 2 octets par tranche.
@@ -186,10 +198,14 @@ contract DipDuckGame {
     mapping(address player => uint256) private _runs;
     mapping(uint32 contest => mapping(address player => Result)) private _best;
     mapping(uint32 contest => Board) private _boards;
+    /// @dev Ligne d'arrivée figée d'un concours joué en mode dégradé ; 0 = course normale.
+    mapping(uint32 contest => uint32) private _frozen;
 
     event DayRecorded(uint32 day, uint64 price);
     event DipFound(uint32 day, uint8 bonus);
     event RunStarted(address indexed player, uint32 contest);
+    /// @notice Concours joué en mode dégradé : course arrêtée au dernier jour évaluable.
+    event ContestFrozen(uint32 contest, uint32 finishDay);
     event ScoreSubmitted(
         address indexed player, uint32 contest, uint32 day, uint32 caught, uint32 coins, uint32 score, bytes32 nickname
     );
@@ -207,6 +223,7 @@ contract DipDuckGame {
     error InvalidNickname();
     error NotBetter();
     error DipOutOfRange();
+    error BackupNotAllowed();
 
     /// @param feed Flux Chainlink BTC/USD (8 décimales).
     /// @param dipDays Jours des baisses historiques, strictement croissants, tous < detectFrom.
@@ -216,15 +233,18 @@ contract DipDuckGame {
     ///        non décroissantes.
     /// @param detectFrom Premier jour évalué par la chaîne (>= 45).
     /// @param recentPrices Prix bruts (USD × 1e8, > 0) des jours detectFrom − 45 … detectFrom + 13.
+    /// @param backupFeed Flux BTC/USD de secours (8 décimales) ; 0 = aucun.
     constructor(
         address feed,
         uint16[] memory dipDays,
         uint8[] memory dipBonus,
         uint16[] memory histMinSeconds,
         uint32 detectFrom,
-        uint64[] memory recentPrices
+        uint64[] memory recentPrices,
+        address backupFeed
     ) {
-        if (feed.code.length == 0) revert InvalidGenesis();
+        if (feed.code.length == 0 || backupFeed == feed) revert InvalidGenesis();
+        if (backupFeed != address(0) && backupFeed.code.length == 0) revert InvalidGenesis();
         uint256 from = detectFrom;
         // Les baisses trouvées tiennent sur 16 bits : on garde de la marge (an 2190).
         if (from < RECENT_BEFORE || from + EVAL_LAG > type(uint16).max) revert InvalidGenesis();
@@ -269,6 +289,7 @@ contract DipDuckGame {
             hasDip: n > 0
         });
         FEED = feed;
+        BACKUP_FEED = backupFeed;
         DETECT_FROM = detectFrom;
         _DATA = store;
         _HIST_DIPS = n;
@@ -283,6 +304,26 @@ contract DipDuckGame {
     ///         seulement des jours terminés, évalue les jours devenus évaluables et met à jour le
     ///         temps minimal. N'importe qui peut l'appeler ; le site calcule les rounds.
     function recordDay(uint80[] calldata roundIds) external {
+        _recordDays(FEED, roundIds);
+    }
+
+    /// @notice Comme `recordDay`, avec les rounds du flux de secours ; seulement si le flux
+    ///         principal est muet depuis plus de STALE_AFTER (voir `mainFeedStale`).
+    function recordDayBackup(uint80[] calldata roundIds) external {
+        if (BACKUP_FEED == address(0) || !mainFeedStale()) revert BackupNotAllowed();
+        _recordDays(BACKUP_FEED, roundIds);
+    }
+
+    /// @notice Vrai si le flux principal ne répond plus ou n'a rien publié depuis STALE_AFTER.
+    function mainFeedStale() public view returns (bool) {
+        try IAggregatorV3(FEED).latestRoundData() returns (uint80, int256, uint256, uint256 u, uint80) {
+            return u < block.timestamp && block.timestamp - u > STALE_AFTER;
+        } catch {
+            return true;
+        }
+    }
+
+    function _recordDays(address feed, uint80[] calldata roundIds) private {
         uint256 n = roundIds.length;
         State memory st = _state;
         uint256 last = st.lastRecorded;
@@ -294,7 +335,7 @@ contract DipDuckGame {
         uint256 prev = _readPacked(_prices, last);
         for (uint256 i; i < n; ++i) {
             uint256 d = last + 1 + i;
-            uint256 price = _closeOf(d, roundIds[i]);
+            uint256 price = _closeOf(feed, d, roundIds[i]);
             _writePacked(_prices, d, price);
             emit DayRecorded(uint32(d), uint64(price));
             sum += _microsFor(prev, price, d);
@@ -316,23 +357,23 @@ contract DipDuckGame {
     ///         avant minuit UTC de fin de ce jour ; sinon BadRound, ou DayNotFinal tant que le
     ///         round suivant n'existe pas encore.
     function closeOf(uint32 day, uint80 roundId) external view returns (uint64) {
-        return uint64(_closeOf(day, roundId));
+        return uint64(_closeOf(FEED, day, roundId));
     }
 
-    function _closeOf(uint256 day, uint80 roundId) private view returns (uint256) {
+    function _closeOf(address feed, uint256 day, uint80 roundId) private view returns (uint256) {
         uint256 end = DATA_START + (day + 1) * 1 days;
-        (bool ok, int256 answer, uint256 at) = _round(roundId);
+        (bool ok, int256 answer, uint256 at) = _round(feed, roundId);
         if (!ok || at > end || answer <= 0 || uint256(answer) > MASK64) revert BadRound(uint32(day));
-        (bool found,, uint256 nextAt) = _round(roundId + 1);
-        if (!found) (found,, nextAt) = _round(uint80((((uint256(roundId) >> 64) + 1) << 64) | 1));
+        (bool found,, uint256 nextAt) = _round(feed, roundId + 1);
+        if (!found) (found,, nextAt) = _round(feed, uint80((((uint256(roundId) >> 64) + 1) << 64) | 1));
         if (!found) revert DayNotFinal(uint32(day));
         if (nextAt <= end) revert BadRound(uint32(day));
         return uint256(answer);
     }
 
     /// @dev Round du flux ; `found` faux s'il n'existe pas (erreur ou updatedAt nul).
-    function _round(uint80 roundId) private view returns (bool found, int256 answer, uint256 updatedAt) {
-        try IAggregatorV3(FEED).getRoundData(roundId) returns (uint80, int256 a, uint256, uint256 u, uint80) {
+    function _round(address feed, uint80 roundId) private view returns (bool found, int256 answer, uint256 updatedAt) {
+        try IAggregatorV3(feed).getRoundData(roundId) returns (uint80, int256 a, uint256, uint256 u, uint80) {
             return (u != 0, a, u);
         } catch {
             return (false, 0, 0);
@@ -490,7 +531,8 @@ contract DipDuckGame {
     /// @return id Numéro du concours.
     /// @return startTs Début du trimestre (inclus).
     /// @return endTs Début du trimestre suivant (exclu).
-    /// @return finishDay Jour où s'arrête la course du concours.
+    /// @return finishDay Jour où s'arrête la course du concours (ramené au dernier jour évaluable
+    ///         en mode dégradé, voir `contestFinishDay`).
     function currentContest() public view returns (uint32 id, uint64 startTs, uint64 endTs, uint32 finishDay) {
         (uint256 year, uint256 month) = _civil(block.timestamp / 1 days);
         if (year < FIRST_YEAR) revert ContestNotReady(); // le contrat n'existe qu'à partir de 2026
@@ -500,11 +542,20 @@ contract DipDuckGame {
         uint256 endDay = q == 3 ? _daysFromCivil(year + 1, 1) : _daysFromCivil(year, 3 * q + 4);
         startTs = uint64(startDay * 1 days);
         endTs = uint64(endDay * 1 days);
-        finishDay = uint32(startDay - UNIX_DAY0 - 1 - FINISH_LAG);
+        finishDay = _frozen[id];
+        if (finishDay != 0) return (id, startTs, endTs, finishDay);
+        uint256 planned = startDay - UNIX_DAY0 - 1 - FINISH_LAG;
+        uint256 last = _state.lastRecorded;
+        // Mode dégradé : prix toujours en retard FREEZE_AFTER après le début du trimestre.
+        if (planned + EVAL_LAG > last && block.timestamp >= startTs + FREEZE_AFTER) planned = last - EVAL_LAG;
+        finishDay = uint32(planned);
     }
 
-    /// @notice Jour où s'arrête la course du concours `id` : (jour du 1er jour du trimestre) − 1 − FINISH_LAG.
-    function contestFinishDay(uint32 id) public pure returns (uint32) {
+    /// @notice Jour où s'arrête la course du concours `id` : (jour du 1er jour du trimestre) − 1 − FINISH_LAG,
+    ///         ou la ligne d'arrivée figée si le concours se joue en mode dégradé.
+    function contestFinishDay(uint32 id) public view returns (uint32) {
+        uint32 frozen = _frozen[id];
+        if (frozen != 0) return frozen;
         uint256 startDay = _daysFromCivil(FIRST_YEAR + id / 4, 3 * (id % 4) + 1);
         return uint32(startDay - UNIX_DAY0 - 1 - FINISH_LAG);
     }
@@ -669,10 +720,15 @@ contract DipDuckGame {
     /// @notice Démarre une partie pour l'appelant dans le concours courant (remplace la partie en
     ///         cours). Ne lit aucun prix : marche même pendant une panne du flux. DataBehind si les
     ///         prix enregistrés ne couvrent pas la course (finishDay + 15 jours, pour que toutes ses
-    ///         baisses soient évaluées) : appeler `recordDay` d'abord.
+    ///         baisses soient évaluées) : appeler `recordDay` d'abord. En mode dégradé, le premier
+    ///         départ fige la ligne d'arrivée du concours (ContestFrozen).
     function startRun() external {
         (uint32 id,,, uint32 finishDay) = currentContest();
         if (uint256(finishDay) + EVAL_LAG > _state.lastRecorded) revert DataBehind();
+        if (_frozen[id] == 0 && finishDay != contestFinishDay(id)) {
+            _frozen[id] = finishDay;
+            emit ContestFrozen(id, finishDay);
+        }
         _runs[msg.sender] = block.timestamp | (uint256(id) << 64);
         emit RunStarted(msg.sender, id);
     }

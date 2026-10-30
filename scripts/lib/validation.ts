@@ -1,6 +1,15 @@
 import { ZeroAddress, getAddress, parseEther } from "ethers";
 
-import { DEAD_ADDRESS, MAX_WHOLE_TOKENS } from "./constants.ts";
+import { DEAD_ADDRESS, MAX_WHOLE_TOKENS, UNIT } from "./constants.ts";
+import {
+  DEFAULT_OPEN_DELAY_SECONDS,
+  MAX_OPEN_DELAY_SECONDS,
+  MIN_OPEN_DELAY_MAINNET_SECONDS,
+  MIN_OPEN_DELAY_SECONDS,
+  curveReserves,
+  curveWholeTokensFor,
+  formatOpenAt,
+} from "./curve.ts";
 import { LaunchError } from "./errors.ts";
 
 export interface TokenParams {
@@ -17,15 +26,32 @@ export interface TokenParams {
   weth?: string;
 }
 
-export interface LiquidityParams {
-  ethAmount: string;
+/** Section `curve` de launch.config.ts. */
+export interface CurveParams {
+  /** Part de l'offre confiée à la courbe (vendue + pool), en %. */
   tokenPercent: number;
+  /** Réserve d'ETH virtuelle, en ETH (ex. "2"). */
+  virtualEth: string;
+  /** ETH à réunir pour ouvrir le pool, en ETH (ex. "3"). */
+  targetEth: string;
+  /** Heure d'ouverture des achats, date ISO en UTC ; vide = dans 2 h (hors mainnet seulement). */
+  openAt: string;
 }
 
-export interface ValidatedLiquidity {
-  ethAmountWei: bigint;
+export interface ValidatedCurve {
   tokenPercent: bigint;
+  /** Tokens entiers confiés à la courbe : tokenPercent de l'offre, arrondi inférieur. */
+  curveWholeTokens: bigint;
+  virtualEthWei: bigint;
+  targetEthWei: bigint;
+  /** Horodatage Unix (s) de l'ouverture des achats. */
+  openAt: bigint;
 }
+
+/** Bornes « raisonnables » de la config (le contrat accepte plus large) : une faute de frappe ne passe pas. */
+const MIN_CURVE_ETH = parseEther("0.01");
+const MAX_VIRTUAL_ETH = parseEther("1000");
+const MAX_TARGET_ETH = parseEther("10000");
 
 export interface VestingParams {
   enabled: boolean;
@@ -128,22 +154,89 @@ export function validateTokenParams(
   }
 }
 
-export function validateLiquidityParams(params: LiquidityParams): ValidatedLiquidity {
-  let ethAmountWei: bigint;
+/** Date ISO avec fuseau (« Z » ou « +02:00 ») → horodatage Unix en secondes, ou undefined si invalide. */
+export function parseIsoDate(value: string): bigint | undefined {
+  const text = value.trim();
+  const parsed = Date.parse(text);
+  if (Number.isNaN(parsed) || !/^\d{4}-\d{2}-\d{2}T/.test(text) || !/(Z|[+-]\d{2}:\d{2})$/.test(text)) return undefined;
+  return BigInt(Math.floor(parsed / 1000));
+}
+
+function parseEthAmount(label: string, value: string, problems: string[]): bigint | undefined {
   try {
-    ethAmountWei = parseEther(params.ethAmount);
+    return parseEther(value.trim());
   } catch {
-    throw new LaunchError(
-      `liquidity.ethAmount invalide : "${params.ethAmount}" (attendu un nombre en ETH, ex. "0.5").`,
-    );
+    problems.push(`${label} invalide : "${value}" (attendu un nombre en ETH, ex. "2" ou "0.5")`);
+    return undefined;
   }
-  if (ethAmountWei <= 0n) {
-    throw new LaunchError("liquidity.ethAmount doit être strictement positif.");
-  }
+}
+
+/**
+ * Paramètres de la courbe de lancement. `now` est l'heure du dernier bloc :
+ * l'ouverture doit être dans le futur (au moins 1 h sur le mainnet, pour
+ * bloquer ta part et annoncer l'heure), à 30 jours au plus, comme l'exige le contrat.
+ */
+export function validateCurveParams(
+  params: CurveParams,
+  options: { supplyWholeTokens: bigint; now: bigint; isMainnet: boolean },
+): ValidatedCurve {
+  const problems: string[] = [];
+  const { now, isMainnet } = options;
+
   if (!Number.isInteger(params.tokenPercent) || params.tokenPercent < 1 || params.tokenPercent > 100) {
-    throw new LaunchError("liquidity.tokenPercent doit être un entier entre 1 et 100.");
+    problems.push("curve.tokenPercent doit être un nombre entier entre 1 et 100");
   }
-  return { ethAmountWei, tokenPercent: BigInt(params.tokenPercent) };
+  const virtualEthWei = parseEthAmount("curve.virtualEth", params.virtualEth, problems);
+  const targetEthWei = parseEthAmount("curve.targetEth", params.targetEth, problems);
+  if (virtualEthWei !== undefined && (virtualEthWei < MIN_CURVE_ETH || virtualEthWei > MAX_VIRTUAL_ETH)) {
+    problems.push("curve.virtualEth doit être compris entre 0.01 et 1000 ETH (il fixe le prix de départ)");
+  }
+  if (targetEthWei !== undefined && (targetEthWei < MIN_CURVE_ETH || targetEthWei > MAX_TARGET_ETH)) {
+    problems.push("curve.targetEth doit être compris entre 0.01 et 10000 ETH (il part en entier dans le pool)");
+  }
+  const tokenPercent = BigInt(Number.isInteger(params.tokenPercent) ? params.tokenPercent : 0);
+  const curveWholeTokens = curveWholeTokensFor(options.supplyWholeTokens, tokenPercent);
+  if (problems.length === 0 && virtualEthWei !== undefined && targetEthWei !== undefined) {
+    if (curveReserves(curveWholeTokens * UNIT, virtualEthWei, targetEthWei) === undefined) {
+      problems.push("la courbe refuserait cette combinaison (offre, curve.tokenPercent, virtualEth, targetEth) : trop peu de tokens");
+    }
+  }
+
+  let openAt = now + DEFAULT_OPEN_DELAY_SECONDS;
+  const minDelay = isMainnet ? MIN_OPEN_DELAY_MAINNET_SECONDS : MIN_OPEN_DELAY_SECONDS;
+  if (params.openAt.trim() === "") {
+    if (isMainnet) {
+      problems.push('curve.openAt est obligatoire sur le mainnet (date ISO en UTC, ex. "2026-12-01T20:00:00Z")');
+    }
+  } else {
+    const parsed = parseIsoDate(params.openAt);
+    if (parsed === undefined) {
+      problems.push(`curve.openAt n'est pas une date ISO avec fuseau (ex. "2026-12-01T20:00:00Z") : "${params.openAt}"`);
+    } else {
+      openAt = parsed;
+      if (parsed <= now) {
+        problems.push(`curve.openAt (${formatOpenAt(parsed)}) est déjà passée`);
+      } else if (parsed < now + minDelay) {
+        problems.push(
+          `curve.openAt (${formatOpenAt(parsed)}) est trop proche : au moins ${minDelay / 60n} minutes après maintenant, ` +
+            "pour vérifier les contrats et annoncer l'heure avant l'ouverture",
+        );
+      } else if (parsed > now + MAX_OPEN_DELAY_SECONDS) {
+        problems.push(`curve.openAt (${formatOpenAt(parsed)}) est à plus de 30 jours : le contrat le refuserait`);
+      }
+    }
+  }
+
+  if (problems.length > 0) {
+    throw new LaunchError(`Paramètres de la courbe invalides :\n  - ${problems.join("\n  - ")}`);
+  }
+  return {
+    tokenPercent,
+    curveWholeTokens,
+    virtualEthWei: virtualEthWei as bigint,
+    targetEthWei: targetEthWei as bigint,
+    openAt,
+  };
 }
 
 /** Casse mixte (somme de contrôle EIP-55) : une faute de frappe dans l'adresse serait détectée. */
@@ -167,8 +260,8 @@ export function validateCommunityParams(
     problems.push("community.percent doit être un nombre entier entre 0 et 99");
   } else if (tokenPercent + BigInt(params.percent) > 100n) {
     problems.push(
-      `liquidity.tokenPercent (${tokenPercent}) + community.percent (${params.percent}) dépasse 100 : ` +
-        "le pool et la réserve ne peuvent pas recevoir plus que l'offre",
+      `curve.tokenPercent (${tokenPercent}) + community.percent (${params.percent}) dépasse 100 : ` +
+        "la courbe et la réserve ne peuvent pas recevoir plus que l'offre",
     );
   }
   const requested = params.beneficiary.trim();

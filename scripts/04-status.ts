@@ -6,10 +6,11 @@
  *   npm run status:testnet
  *   npm run status:mainnet
  */
-import { Contract } from "ethers";
+import { Contract, MaxUint256 } from "ethers";
 import hre from "hardhat";
 
-import { launchConfig } from "../launch.config.ts";
+import { UNIT } from "./lib/constants.ts";
+import { formatDelay, formatOpenAt, readCurveStatus } from "./lib/curve.ts";
 import { LaunchError, runScript } from "./lib/errors.ts";
 import { formatDate, formatEth, formatRatio, formatTokenAmount, heading, percent, row } from "./lib/format.ts";
 import { explorerLink, resolveNetworkProfile } from "./lib/networks.ts";
@@ -27,53 +28,80 @@ await runScript(async () => {
   const record = await journal.read();
   const step = profile.isMainnet ? "mainnet" : "testnet";
 
+  if (record?.vesting?.status === "pending") {
+    console.log("\n  ⚠ Le déploiement du contrat de blocage est noté mais pas encore confirmé.");
+    console.log(`  Relance npm run deploy:${step} pour reprendre son suivi.`);
+  }
   if (record?.token === undefined) {
     throw new LaunchError(`Aucun token dans le journal (${journal.location}).`);
   }
   if (record.token.status !== "confirmed") {
-    console.log(`\n  Déploiement noté (nonce ${record.token.nonce}) mais pas encore confirmé.`);
+    console.log(`\n  Déploiement de la courbe noté (nonce ${record.token.nonce}) mais pas encore confirmé.`);
     console.log(`  Relance npm run deploy:${step} pour reprendre son suivi.`);
     return;
   }
-  if ([record.seeder, record.approval, record.liquidity].some((entry) => entry?.status === "pending")) {
-    console.log("\n  ⚠ Une étape de l'ouverture du pool est notée mais pas encore confirmée.");
-    console.log("  Relance npm run liquidity:mainnet pour reprendre son suivi.");
-  }
-  if (record.vesting?.status === "pending" || record.lock?.status === "pending" || record.community?.status === "pending") {
-    console.log("\n  ⚠ Le blocage de ta part ou l'envoi de la réserve communauté est noté mais pas encore confirmé.");
-    console.log(`  Relance npm run lock:${step} pour reprendre son suivi.`);
-  }
 
   const token = new Contract(record.token.address, ERC20_ABI, ethers.provider);
-  const [name, symbol, totalSupply, deployerBalance] = (await Promise.all([
-    token.name(),
-    token.symbol(),
-    token.totalSupply(),
-    token.balanceOf(record.token.from),
-  ])) as [string, string, bigint, bigint];
+  const [name, symbol, totalSupply, deployerBalance, curve, latest] = await Promise.all([
+    token.name() as Promise<string>,
+    token.symbol() as Promise<string>,
+    token.totalSupply() as Promise<bigint>,
+    token.balanceOf(record.token.from) as Promise<bigint>,
+    readCurveStatus(ethers.provider, record.token.curve),
+    ethers.provider.getBlock("latest"),
+  ]);
+  const now = BigInt(latest?.timestamp ?? Math.floor(Date.now() / 1000));
+  const curveBalance = (await token.balanceOf(curve.curve)) as bigint;
 
   heading(`${name} (${symbol}) — ${profile.label}`);
-  row("Contrat", record.token.address);
+  row("Token", record.token.address);
   row("Offre totale", `${formatTokenAmount(totalSupply)} ${symbol}`);
-  row("Détenu par le déployeur", `${formatTokenAmount(deployerBalance)} ${symbol} (${percent(deployerBalance, totalSupply)})`);
+  row("Détenu par le déployeur", deployerBalance === 0n ? "rien ✔" : `${formatTokenAmount(deployerBalance)} ${symbol} ⚠`);
   row("Explorateur", explorerLink(profile, "token", record.token.address) ?? "—");
 
-  if (record.vesting?.status === "confirmed") {
+  heading("Courbe de lancement");
+  row("Adresse (pour acheter)", curve.curve);
+  const open = now >= curve.openAt;
+  row("Ouverture des achats", `${formatOpenAt(curve.openAt)} — ${open ? "ouverte ✔" : `pas encore (${formatDelay(curve.openAt, now)})`}`);
+  row("ETH réuni", `${formatEth(curve.ethReserve)} / ${formatEth(curve.targetEth)} (${percent(curve.ethReserve, curve.targetEth)})`);
+  row(
+    "Tokens vendus",
+    `${formatTokenAmount(curve.tokensSold)} ${symbol} — ${percent(curve.tokensSold, curve.curveTokens)} de ce que la courbe vend, ` +
+      `${percent(curve.tokensSold, totalSupply)} de l'offre`,
+  );
+  if (!curve.graduated) {
+    row("Prix actuel", `${formatRatio(curve.price, UNIT)} ETH par ${symbol}`);
+    row("Capitalisation actuelle", formatEth((curve.price * totalSupply) / UNIT));
+    row(
+      "Limite par wallet",
+      !open
+        ? "achats pas encore ouverts"
+        : curve.walletLimit === MaxUint256
+          ? "aucune (24 h passées)"
+          : `${formatTokenAmount(curve.walletLimit)} ${symbol} (${percent(curve.walletLimit, totalSupply)} de l'offre)`,
+    );
+    row("Tokens dans la courbe", `${formatTokenAmount(curveBalance)} ${symbol} (ta part et la réserve comprises)`);
+  }
+  row("Explorateur", explorerLink(profile, "address", curve.curve) ?? "—");
+
+  if (curve.vestingTokens > 0n && record.vesting?.status === "confirmed") {
     const vesting = await readVestingStatus(ethers.provider, record.vesting.address, record.token.address);
-    const now = BigInt(Math.floor(Date.now() / 1000));
-    heading("Part bloquée (vesting)");
+    heading("Ta part (vesting)");
     row("Contrat de blocage", record.vesting.address);
     row("Bénéficiaire", vesting.beneficiary);
-    row("Encore bloqué", `${formatTokenAmount(vesting.locked)} ${symbol} (${percent(vesting.locked, totalSupply)} de l'offre)`);
-    row("Déjà versé", `${formatTokenAmount(vesting.released)} ${symbol}`);
-    row("Libérable maintenant", `${formatTokenAmount(vesting.releasable)} ${symbol}`);
+    row("Prévue", `${formatTokenAmount(curve.vestingTokens)} ${symbol} (${percent(curve.vestingTokens, totalSupply)} de l'offre)`);
+    if (!curve.graduated) {
+      row("", "gardée par la courbe, versée au contrat de blocage à l'ouverture du pool");
+    } else {
+      row("Encore bloqué", `${formatTokenAmount(vesting.locked)} ${symbol}`);
+      row("Déjà versé", `${formatTokenAmount(vesting.released)} ${symbol}`);
+      row("Libérable maintenant", `${formatTokenAmount(vesting.releasable)} ${symbol}`);
+    }
     row("Falaise", `${formatDate(vesting.cliff)}${now < vesting.cliff ? " — rien de libérable avant" : " ✔ passée"}`);
     row("Fin", formatDate(vesting.end));
     row("Explorateur", explorerLink(profile, "address", record.vesting.address) ?? "—");
     if (vesting.releasable > 0n) {
-      const pending = [record.vesting, record.lock, record.community, record.seeder, record.approval, record.liquidity].some(
-        (entry) => entry?.status === "pending",
-      );
+      const pending = [record.vesting, record.token, record.nft, record.game].some((entry) => entry?.status === "pending");
       console.log(
         pending
           ? "\n  Une part est libérable : termine d'abord l'étape notée en attente, puis npm run release:" + step
@@ -82,35 +110,32 @@ await runScript(async () => {
     }
   }
 
-  if (record.community?.status === "confirmed") {
-    const held = (await token.balanceOf(record.community.recipient)) as bigint;
+  if (curve.communityTokens > 0n) {
+    const held = (await token.balanceOf(curve.community)) as bigint;
     heading("Réserve communauté");
-    row("Wallet communauté", record.community.recipient);
-    row("Envoyé au lancement", `${formatTokenAmount(BigInt(record.community.amount))} ${symbol}`);
-    row("Solde actuel", `${formatTokenAmount(held)} ${symbol} (${percent(held, totalSupply)} de l'offre)`);
-    row("Explorateur", explorerLink(profile, "address", record.community.recipient) ?? "—");
+    row("Safe communauté", curve.community);
+    row("Prévue", `${formatTokenAmount(curve.communityTokens)} ${symbol} (${percent(curve.communityTokens, totalSupply)} de l'offre)`);
+    row("Solde actuel", curve.graduated ? `${formatTokenAmount(held)} ${symbol}` : "rien avant l'ouverture du pool (gardée par la courbe)");
+    row("Explorateur", explorerLink(profile, "address", curve.community) ?? "—");
   }
 
-  if (profile.uniswapV2 === undefined) {
-    console.log("\n  Pas de pool Uniswap v2 référencé sur ce réseau.");
-    return;
-  }
-
-  const pool = await readPoolStatus(ethers.provider, profile.uniswapV2, record.token.address, record.token.from);
-  if (pool === undefined || pool.lpTotalSupply === 0n) {
-    const teamPercent = 100 - launchConfig.liquidity.tokenPercent - launchConfig.community.percent;
-    const shareNotLocked =
-      (launchConfig.vesting.enabled && teamPercent > 0 && record.lock?.status !== "confirmed") ||
-      (launchConfig.community.percent > 0 && record.community?.status !== "confirmed");
+  if (!curve.graduated) {
     console.log(
-      shareNotLocked
-        ? "\n  Pas encore de pool : bloque d'abord ta part et envoie la réserve (npm run lock:mainnet), puis npm run liquidity:mainnet"
-        : "\n  Pas encore de pool : étape suivante, npm run liquidity:mainnet",
+      `\n  Pool pas encore ouvert : il s'ouvrira tout seul quand la courbe aura réuni ${formatEth(curve.targetEth)}` +
+        ` (il manque ${formatEth(curve.targetEth - curve.ethReserve)}).`,
     );
     return;
   }
 
-  heading("Pool Uniswap v2");
+  heading("Pool Uniswap v2 (ouvert par la courbe)");
+  const pool = profile.uniswapV2 === undefined
+    ? undefined
+    : await readPoolStatus(ethers.provider, profile.uniswapV2, record.token.address, record.token.from);
+  if (pool === undefined) {
+    row("Paire", curve.pair);
+    console.log("\n  Uniswap v2 n'est pas référencé sur ce réseau : réserves non lues.");
+    return;
+  }
   row("Paire", pool.pair);
   row("Réserves", `${formatTokenAmount(pool.tokenReserve)} ${symbol} / ${formatEth(pool.wethReserve)}`);
   row("Prix actuel", `${formatRatio(pool.wethReserve, pool.tokenReserve)} ETH par ${symbol}`);
@@ -118,14 +143,7 @@ await runScript(async () => {
     "Capitalisation actuelle",
     pool.tokenReserve === 0n ? "—" : formatEth((pool.wethReserve * totalSupply) / pool.tokenReserve),
   );
-  if (record.liquidity?.status === "confirmed" && record.liquidity.lpBurned !== undefined) {
-    row("LP du lancement", `${formatTokenAmount(BigInt(record.liquidity.lpBurned))} parts, toutes brûlées ✔`);
-  }
   row("Part du pool verrouillée", `${percent(pool.lpBurned, pool.lpTotalSupply)} (adresse morte + adresse 0)`);
   row("Parts LP du déployeur", pool.lpHeldBy === 0n ? "aucune ✔" : `${pool.lpHeldBy} ⚠`);
   row("Explorateur (paire)", explorerLink(profile, "address", pool.pair) ?? "—");
-
-  if (record.liquidity?.status === "confirmed" && deployerBalance > 0n && record.lock === undefined) {
-    console.log(`\n  ⚠ Ta part (${percent(deployerBalance, totalSupply)}) n'est pas bloquée : npm run lock:${step}`);
-  }
 });

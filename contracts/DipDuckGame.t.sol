@@ -21,7 +21,7 @@ contract GameHarness is DipDuckGame {
         uint16[] memory histMinSeconds,
         uint32 detectFrom,
         uint64[] memory recentPrices
-    ) DipDuckGame(feed, dipDays, dipBonus, histMinSeconds, detectFrom, recentPrices) {}
+    ) DipDuckGame(feed, dipDays, dipBonus, histMinSeconds, detectFrom, recentPrices, address(0)) {}
 
     function microsFor(uint256 p0, uint256 p1, uint256 day) external pure returns (uint256) {
         return _microsFor(p0, p1, day);
@@ -129,7 +129,7 @@ contract DipDuckGameTest {
         private
         returns (DipDuckGame)
     {
-        return new DipDuckGame(address(feed), days_, bonus, _table(from, step), from, prices);
+        return new DipDuckGame(address(feed), days_, bonus, _table(from, step), from, prices, address(0));
     }
 
     function _taps(uint32 a) private pure returns (uint32[] memory t) {
@@ -255,7 +255,7 @@ contract DipDuckGameTest {
         uint64[] memory prices
     ) private {
         vm.expectRevert(_err(DipDuckGame.InvalidGenesis.selector));
-        new DipDuckGame(feed_, days_, bonus, table, from, prices);
+        new DipDuckGame(feed_, days_, bonus, table, from, prices, address(0));
     }
 
     function test_InvalidGenesis() public {
@@ -285,8 +285,8 @@ contract DipDuckGameTest {
         _expectInvalid(address(feed), new uint16[](0), new uint8[](0), _table(44, 1), 44, p); // detectFrom < 45
         // Limites acceptées : baisse à detectFrom − 1, bonus 10, detectFrom = 45, aucune baisse.
         big[2] = 10;
-        new DipDuckGame(address(feed), d, big, _table(301, 1), 301, p);
-        new DipDuckGame(address(feed), new uint16[](0), new uint8[](0), _table(45, 1), 45, p);
+        new DipDuckGame(address(feed), d, big, _table(301, 1), 301, p, address(0));
+        new DipDuckGame(address(feed), new uint16[](0), new uint8[](0), _table(45, 1), 45, p, address(0));
     }
 
     // --- Enregistrement des prix -------------------------------------------------------------
@@ -472,6 +472,87 @@ contract DipDuckGameTest {
         game.recordDay(ids);
         require(game.priceAt(H + 3) == 103e8 && game.priceAt(H + 8) == 103e8 && game.priceAt(H + 9) == 150e8, "clotures");
         require(game.lastRecordedDay() == H + 9 && game.daysBehind() == 0, "a jour");
+    }
+
+    function test_BackupFeedOnlyWhenMainIsStale() public {
+        bytes memory refused = _err(DipDuckGame.BackupNotAllowed.selector);
+        // Sans flux de secours : toujours refusé.
+        vm.warp(_ts(H + 5));
+        vm.expectRevert(refused);
+        game.recordDayBackup(new uint80[](1));
+
+        vm.warp(_ts(H) + 3600);
+        MockAggregator backup = new MockAggregator(100e8);
+        DipDuckGame g = new DipDuckGame(
+            address(feed), _baseDays(), _baseBonus(), _table(D, 1), D, _flat(100e8), address(backup)
+        );
+        require(g.BACKUP_FEED() == address(backup) && !g.mainFeedStale(), "secours note");
+        // Dernier round du principal : jour H + 1 à 1 h. Le secours publie H + 1 … H + 3.
+        feed.setAnswer(100e8, _ts(H + 1) + 3600);
+        uint80[] memory ids = new uint80[](2);
+        for (uint256 d = H + 1; d <= H + 3; ++d) {
+            backup.setAnswer(int256((200 + d - H) * 1e8), _ts(d) + 3600);
+            if (d <= H + 2) ids[d - H - 1] = backup.latestRound();
+        }
+        // Principal muet depuis moins de 2 jours : secours refusé.
+        vm.warp(_ts(H + 3) + 3600);
+        vm.expectRevert(refused);
+        g.recordDayBackup(ids);
+        // Plus de 2 jours : secours permis, mêmes vérifications des rounds.
+        vm.warp(_ts(H + 3) + 3601);
+        require(g.mainFeedStale(), "muet");
+        g.recordDayBackup(ids);
+        require(g.lastRecordedDay() == H + 2 && g.priceAt(H + 1) == 201e8 && g.priceAt(H + 2) == 202e8, "secours");
+        // Le principal repart : recordDay reprend avec lui, le secours est de nouveau refusé.
+        feed.setAnswer(300e8, _ts(H + 3) + 7200);
+        uint80 r3 = feed.latestRound();
+        feed.setAnswer(301e8, _ts(H + 4) + 60);
+        vm.warp(_ts(H + 4) + 120);
+        vm.expectRevert(refused);
+        g.recordDayBackup(new uint80[](1));
+        uint80[] memory one = new uint80[](1);
+        one[0] = r3;
+        g.recordDay(one);
+        require(g.lastRecordedDay() == H + 3 && g.priceAt(H + 3) == 300e8, "principal");
+    }
+
+    function test_InvalidBackupFeed() public {
+        bytes memory invalid = _err(DipDuckGame.InvalidGenesis.selector);
+        vm.expectRevert(invalid); // le même flux
+        new DipDuckGame(address(feed), _baseDays(), _baseBonus(), _table(D, 1), D, _flat(100e8), address(feed));
+        vm.expectRevert(invalid); // pas un contrat
+        new DipDuckGame(address(feed), _baseDays(), _baseBonus(), _table(D, 1), D, _flat(100e8), ALICE);
+    }
+
+    function test_DegradedModeFreezesTheContest() public {
+        // T1 2027 (concours 4) : course prévue jusqu'au jour 5964, il faut les prix jusqu'à 5979.
+        // Le flux s'arrête au jour H = 5913.
+        uint256 start = 1798761600; // 2027-01-01
+        bytes memory behind = _err(DipDuckGame.DataBehind.selector);
+        vm.warp(start + 14 days - 1);
+        (,,, uint32 f) = game.currentContest();
+        require(f == 5964, "course normale pendant 14 jours");
+        vm.prank(ALICE);
+        vm.expectRevert(behind);
+        game.startRun();
+        // 14 jours après le début du trimestre : course figée sur ce qui est connu.
+        vm.warp(start + 14 days);
+        (,,, f) = game.currentContest();
+        require(f == H - 15 && game.contestFinishDay(4) == 5964, "mode degrade");
+        vm.prank(ALICE);
+        game.startRun();
+        require(game.contestFinishDay(4) == H - 15, "fige au premier depart");
+        // Les prix reviennent : le concours reste figé (classement cohérent) ; le suivant est normal.
+        _recordTo(game, 5990, 100e8);
+        (,,, f) = game.currentContest();
+        require(f == H - 15 && game.contestFinishDay(4) == H - 15, "reste fige");
+        vm.prank(BOB);
+        game.startRun();
+        (, uint32 contest) = game.runOf(BOB);
+        require(contest == 4 && game.contestFinishDay(5) == 6054, "suivant normal");
+        // La partie d'Alice est rejouée sur la course figée.
+        (uint32 day,,,,) = game.verify(new uint32[](0), H - 15);
+        require(day > 0 && day <= H - 15, "course figee");
     }
 
     // --- Détection des baisses --------------------------------------------------------------
@@ -665,8 +746,10 @@ contract DipDuckGameTest {
         vm.warp(ts);
         (uint32 id, uint64 s, uint64 e, uint32 f) = game.currentContest();
         require(s <= ts && ts < e, "dans le trimestre");
-        require(f == game.contestFinishDay(id), "finishDay");
-        require(uint256(f) == s / 1 days - 14839 - 16, "16 jours avant");
+        // Prix arrêtés au jour H : course pas couverte et 14 jours de trimestre passés = mode dégradé (H − 15).
+        uint32 planned = game.contestFinishDay(id);
+        require(f == (ts >= s + 14 days && planned + 15 > H ? H - 15 : planned), "finishDay");
+        require(uint256(game.contestFinishDay(id)) == s / 1 days - 14839 - 16, "16 jours avant");
         uint256 year = _refYear(ts / 1 days - 14839);
         require(id / 4 + 2026 == year, "annee");
         // Le début du trimestre est un 1er janvier, avril, juillet ou octobre.

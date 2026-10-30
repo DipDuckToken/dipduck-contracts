@@ -40,53 +40,49 @@ export interface JournaledTx {
   confirmedAt?: string;
 }
 
+/**
+ * Déploiement de la courbe de lancement (LaunchCurve), qui crée elle-même le token
+ * et garde 100 % de l'offre jusqu'à l'ouverture du pool.
+ */
 export interface TokenRecord extends JournaledTx {
-  /** Adresse prévue (CREATE : déployeur + nonce), identique à l'adresse finale. */
+  /** Adresse du TOKEN : 1er contrat créé par la courbe (CREATE : courbe + nonce 1), connue avant diffusion. */
   address: string;
   name: string;
   symbol: string;
   supplyWholeTokens: string;
-  /** Factory et WETH Uniswap v2 passés au constructeur (absents = pas de limite anti-bot). */
-  factory?: string;
-  weth?: string;
-}
-
-export interface SeederRecord extends JournaledTx {
-  address: string;
+  /** Factory et WETH Uniswap v2 de la paire. */
   factory: string;
   weth: string;
+  /** Adresse de la courbe (CREATE : déployeur + nonce), connue avant diffusion. */
+  curve: string;
+  /** Part de l'offre confiée à la courbe (curve.tokenPercent au déploiement). */
+  curveTokenPercent: number;
+  curveWholeTokens: string;
+  /** Contrat de blocage qui recevra ta part à l'ouverture du pool (adresse 0 = aucun). */
+  vesting: string;
+  vestingWholeTokens: string;
+  /** Safe communauté qui recevra la réserve à l'ouverture du pool (adresse 0 = aucune). */
+  community: string;
+  communityWholeTokens: string;
+  virtualEthWei: string;
+  targetEthWei: string;
+  /** Horodatage Unix (s) de l'ouverture des achats. */
+  openAt: string;
+  /** Paire Uniswap v2 TOKEN/WETH, lue après confirmation. */
+  pair?: string;
 }
 
-/** Autorisation (approve) du PoolSeeder, pour le montant exact, notée comme les autres transactions. */
-export interface ApprovalRecord extends JournaledTx {
-  token: string;
-  spender: string;
-  amount: string;
-}
-
-/** Contrat de vesting qui bloque la part gardée par le créateur. */
+/**
+ * Contrat de vesting qui recevra ta part à l'ouverture du pool. Déployé AVANT la
+ * courbe (il ne dépend pas du token) : la courbe connaît son adresse dès le départ.
+ */
 export interface VestingRecord extends JournaledTx {
   address: string;
-  token: string;
   beneficiary: string;
-  /** Arguments du constructeur : début (horodatage Unix), durée et falaise en secondes. */
+  /** Arguments du constructeur : début (horodatage Unix = ouverture des achats), durée et falaise en secondes. */
   start: string;
   durationSeconds: string;
   cliffSeconds: string;
-}
-
-/** Transfert de la part gardée vers le contrat de vesting. */
-export interface LockRecord extends JournaledTx {
-  token: string;
-  vesting: string;
-  amount: string;
-}
-
-/** Transfert de la réserve communauté vers son wallet dédié. */
-export interface CommunityRecord extends JournaledTx {
-  token: string;
-  recipient: string;
-  amount: string;
 }
 
 /** Contrat des cartes NFT Dip Duck (déployé après le lancement du token). */
@@ -108,6 +104,8 @@ export interface GameRecord extends JournaledTx {
   address: string;
   /** Flux Chainlink BTC/USD (8 décimales). */
   feed: string;
+  /** Flux BTC/USD de secours (adresse 0 = aucun) ; absent dans un ancien journal = aucun. */
+  backupFeed?: string;
   detectFrom: number;
   dipDays: number[];
   dipBonus: number[];
@@ -116,34 +114,17 @@ export interface GameRecord extends JournaledTx {
   recentPrices: string[];
 }
 
-export interface LiquidityRecord extends JournaledTx {
-  seeder: string;
-  tokenAmount: string;
-  ethAmountWei: string;
-  /** WETH déjà présent dans la paire (dons) accepté au maximum. */
-  maxPairWeth: string;
-  lpRecipient: string;
-  pair?: string;
-  /** Parts LP émises vers l'adresse morte par ce dépôt (lu dans le reçu). */
-  lpBurned?: string;
-}
-
 export interface LaunchRecord {
   network: string;
   chainId: string;
   /**
    * Prochain nonce minimal du wallet d'après les reçus déjà vus — transactions
-   * en échec et autorisations comprises. Jamais diminué, même quand une étape
+   * en échec comprises. Jamais diminué, même quand une étape
    * revient en arrière : un RPC en retard ne peut pas faire réutiliser un nonce.
    */
   nonceFloor?: number;
   token?: TokenRecord;
-  seeder?: SeederRecord;
-  approval?: ApprovalRecord;
-  liquidity?: LiquidityRecord;
   vesting?: VestingRecord;
-  lock?: LockRecord;
-  community?: CommunityRecord;
   nft?: NftRecord;
   game?: GameRecord;
 }

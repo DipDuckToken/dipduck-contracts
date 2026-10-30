@@ -75,7 +75,7 @@ contract DipDuckCards is ERC721 {
     uint256 internal constant VOTING_PERIOD = 7 days;
     /// @notice Quorum (oui + non) : max(MIN_QUORUM, QUORUM_PERCENT % des cartes au snapshot, arrondi au-dessus).
     uint256 internal constant MIN_QUORUM = 25;
-    uint256 internal constant QUORUM_PERCENT = 5;
+    uint256 internal constant QUORUM_PERCENT = 10;
     /// @notice Approbations au plus par période de 30 jours (période de la finalisation).
     uint256 internal constant MAX_APPROVALS_PER_ROUND = 3;
     /// @notice Une fondation approuvée sans aucune victoire pendant ce nombre de périodes de suite expire.
@@ -808,7 +808,7 @@ contract DipDuckCards is ERC721 {
         emit ProposalVoted(id, msg.sender, support, tokenIds.length);
     }
 
-    /// @notice Quorum d'une proposition : max(MIN_QUORUM, 5 % des cartes au snapshot, arrondi au-dessus).
+    /// @notice Quorum d'une proposition : max(MIN_QUORUM, 10 % des cartes au snapshot, arrondi au-dessus).
     function _quorumFor(uint256 snapshot) internal pure returns (uint256) {
         uint256 q = (snapshot * QUORUM_PERCENT + 99) / 100;
         return q < MIN_QUORUM ? MIN_QUORUM : q;

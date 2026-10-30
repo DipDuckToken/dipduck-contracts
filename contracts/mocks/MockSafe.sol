@@ -18,6 +18,7 @@ contract MockSafe {
     address private singleton;
     address[] private owners;
     uint256 private threshold;
+    address private module;
 
     constructor(address singleton_, address[] memory owners_, uint256 threshold_) {
         singleton = singleton_;
@@ -31,6 +32,17 @@ contract MockSafe {
 
     function getThreshold() external view returns (uint256) {
         return threshold;
+    }
+
+    /// @notice Active un module (tests du refus des Safes à module).
+    function enableModule(address module_) external {
+        module = module_;
+    }
+
+    function getModulesPaginated(address, uint256) external view returns (address[] memory array, address next) {
+        array = new address[](module == address(0) ? 0 : 1);
+        if (module != address(0)) array[0] = module;
+        next = address(1);
     }
 
     receive() external payable {}

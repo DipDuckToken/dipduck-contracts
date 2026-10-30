@@ -15,23 +15,8 @@ export const UNIT = 10n ** 18n;
  */
 export const MAX_WHOLE_TOKENS = (2n ** 112n - 1n) / UNIT;
 
-/** Validité des transactions Uniswap, en secondes après le dernier bloc. */
+/** Validité des transactions (courbe, Uniswap), en secondes après le dernier bloc. */
 export const TX_DEADLINE_SECONDS = 600n;
-
-/**
- * Don de WETH toléré entre l'affichage du plan et l'ouverture du pool, en points
- * de base de l'ETH apporté (100 = 1 %). Sans marge, un tiers pourrait bloquer
- * l'ouverture en ajoutant 1 wei avant chaque essai (puis le reprendre) ; avec
- * elle, le prix de départ ne peut pas dépasser de plus de 1 % celui que tu valides.
- */
-export const DONATION_TOLERANCE_BPS = 100n;
-
-/**
- * Gas réservé pour l'étape 3 : déploiement du PoolSeeder, approve et ouverture du pool.
- * Large exprès : sur Robinhood Chain (Arbitrum Nitro), l'estimation inclut aussi les
- * frais de données L1, convertis en gas L2.
- */
-export const LIQUIDITY_GAS_RESERVE = 8_000_000n;
 
 /**
  * Délai maximal d'attente d'un reçu avant de rendre la main (la reprise prend le

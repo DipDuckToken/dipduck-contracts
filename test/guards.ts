@@ -5,17 +5,19 @@ import path from "node:path";
 import { expect } from "chai";
 import hre from "hardhat";
 
+import { parseEther } from "ethers";
+
 import { MAX_WHOLE_TOKENS, UNIT } from "../scripts/lib/constants.ts";
+import { buildCurvePlan, curveReserves, formatDelay, splitSupply } from "../scripts/lib/curve.ts";
 import { LaunchError } from "../scripts/lib/errors.ts";
 import { formatEth, formatRatio, formatTokenAmount, percent } from "../scripts/lib/format.ts";
 import { acquireLock, fileJournal } from "../scripts/lib/records.ts";
 import { isFeeCapExceeded, isFeeRejection } from "../scripts/lib/tx.ts";
-import { buildLiquidityPlan } from "../scripts/lib/uniswap.ts";
-import { assertCliffAhead, communityShare, poolBaseAmount, poolShare, shareToLock } from "../scripts/lib/vesting.ts";
 import {
   containsRobinhoodMark,
+  parseIsoDate,
   validateCommunityParams,
-  validateLiquidityParams,
+  validateCurveParams,
   validateTokenParams,
   validateVestingParams,
 } from "../scripts/lib/validation.ts";
@@ -42,7 +44,7 @@ describe("Surface du contrat", function () {
     const abi = artifact.abi as Array<{ type: string; name?: string; stateMutability?: string }>;
 
     const functions = abi.filter((item) => item.type === "function");
-    const antiBot = ["LIMIT_DURATION", "PAIR", "launchedAt", "walletLimit"];
+    const antiBot = ["LAUNCHER", "LIMIT_DURATION", "PAIR", "launchedAt", "walletLimit"];
     expect(functions.map((item) => item.name).sort()).to.deep.equal([...STANDARD_ERC20_FUNCTIONS, ...antiBot].sort());
     // L'anti-bot se lit seulement : rien ne permet de le modifier, le prolonger ou l'arrêter.
     for (const name of antiBot) {
@@ -57,13 +59,13 @@ describe("Surface du contrat", function () {
     expect(constructor?.stateMutability).to.equal("nonpayable");
   });
 
-  it("le PoolSeeder n'a qu'une fonction d'écriture et aucun owner", async function () {
-    const artifact = await hre.artifacts.readArtifact("PoolSeeder");
+  it("la courbe n'a que deux fonctions d'écriture (achat, revente), aucun owner, et refuse l'ETH envoyé directement", async function () {
+    const artifact = await hre.artifacts.readArtifact("LaunchCurve");
     const abi = artifact.abi as Array<{ type: string; name?: string; stateMutability?: string }>;
     const functions = abi.filter((item) => item.type === "function");
-    expect(functions.map((item) => item.name).sort()).to.deep.equal(["DEAD", "FACTORY", "WETH", "seed"]);
     const writable = functions.filter((item) => item.stateMutability !== "view" && item.stateMutability !== "pure");
-    expect(writable.map((item) => item.name)).to.deep.equal(["seed"]);
+    expect(writable.map((item) => item.name).sort()).to.deep.equal(["buy", "sell"]);
+    expect(functions.some((item) => /owner|admin|pause|set/i.test(item.name ?? ""))).to.equal(false);
     expect(abi.some((item) => item.type === "receive" || item.type === "fallback")).to.equal(false);
   });
 
@@ -124,60 +126,99 @@ describe("Garde-fous des paramètres", function () {
     expectInvalid(() => validateTokenParams({ ...valid, name: " Chat" }, { allowPlaceholder: false }), /espace/);
   });
 
-  it("valide les paramètres de liquidité", function () {
-    expect(validateLiquidityParams({ ethAmount: "0.5", tokenPercent: 100 })).to.deep.equal({
-      ethAmountWei: 500_000_000_000_000_000n,
-      tokenPercent: 100n,
+});
+
+describe("Paramètres de la courbe", function () {
+  const now = 1_800_000_000n;
+  const valid = { tokenPercent: 87, virtualEth: "2", targetEth: "3", openAt: "" };
+  const iso = (seconds: bigint) => new Date(Number(seconds) * 1000).toISOString();
+  const options = { supplyWholeTokens: 1_000_000_000n, now, isMainnet: true };
+
+  it("accepte la config par défaut avec une heure d'ouverture valide ; montants en wei", function () {
+    const curve = validateCurveParams({ ...valid, openAt: iso(now + 2n * 3600n) }, options);
+    expect(curve).to.deep.equal({
+      tokenPercent: 87n,
+      curveWholeTokens: 870_000_000n,
+      virtualEthWei: parseEther("2"),
+      targetEthWei: parseEther("3"),
+      openAt: now + 2n * 3600n,
     });
-    expectInvalid(() => validateLiquidityParams({ ethAmount: "abc", tokenPercent: 100 }), /ethAmount/);
-    expectInvalid(() => validateLiquidityParams({ ethAmount: "0", tokenPercent: 100 }), /positif/);
-    expectInvalid(() => validateLiquidityParams({ ethAmount: "1", tokenPercent: 0 }), /tokenPercent/);
-    expectInvalid(() => validateLiquidityParams({ ethAmount: "1", tokenPercent: 50.5 }), /tokenPercent/);
+    expect(parseIsoDate("2026-12-01T20:00:00Z")).to.equal(BigInt(Date.parse("2026-12-01T20:00:00Z") / 1000));
+    expect(parseIsoDate("2026-12-01T20:00:00")).to.equal(undefined); // sans fuseau : ambigu
+    expect(parseIsoDate("1er décembre")).to.equal(undefined);
+  });
+
+  it("exige une heure d'ouverture sur le mainnet : future, au moins 1 h, au plus 30 jours", function () {
+    expectInvalid(() => validateCurveParams(valid, options), /obligatoire sur le mainnet/);
+    expectInvalid(() => validateCurveParams({ ...valid, openAt: iso(now - 60n) }, options), /déjà passée/);
+    expectInvalid(() => validateCurveParams({ ...valid, openAt: iso(now + 1800n) }, options), /trop proche/);
+    expectInvalid(() => validateCurveParams({ ...valid, openAt: iso(now + 31n * 86_400n) }, options), /plus de 30 jours/);
+    expectInvalid(() => validateCurveParams({ ...valid, openAt: "2026-12-01 20:00" }, options), /date ISO/);
+    // Hors mainnet : vide = dans 2 h, et 15 minutes suffisent.
+    expect(validateCurveParams(valid, { ...options, isMainnet: false }).openAt).to.equal(now + 7200n);
+    expect(validateCurveParams({ ...valid, openAt: iso(now + 1800n) }, { ...options, isMainnet: false }).openAt).to.equal(now + 1800n);
+  });
+
+  it("refuse une part, un ETH virtuel ou une cible déraisonnables", function () {
+    const openAt = iso(now + 7200n);
+    expectInvalid(() => validateCurveParams({ ...valid, openAt, tokenPercent: 0 }, options), /tokenPercent/);
+    expectInvalid(() => validateCurveParams({ ...valid, openAt, tokenPercent: 87.5 }, options), /tokenPercent/);
+    expectInvalid(() => validateCurveParams({ ...valid, openAt, virtualEth: "abc" }, options), /virtualEth invalide/);
+    expectInvalid(() => validateCurveParams({ ...valid, openAt, virtualEth: "0" }, options), /virtualEth doit/);
+    expectInvalid(() => validateCurveParams({ ...valid, openAt, virtualEth: "5000" }, options), /virtualEth doit/);
+    expectInvalid(() => validateCurveParams({ ...valid, openAt, targetEth: "0.001" }, options), /targetEth doit/);
+    expectInvalid(() => validateCurveParams({ ...valid, openAt, targetEth: "20000" }, options), /targetEth doit/);
+    // Trop peu de tokens pour la cible (le contrat exige 10^6 unités par wei de la cible).
+    expectInvalid(
+      () => validateCurveParams({ ...valid, openAt, targetEth: "1000" }, { ...options, supplyWholeTokens: 1000n }),
+      /refuserait/,
+    );
   });
 });
 
-describe("Ta part et le pool", function () {
-  const supply = 1_000_000_000n * UNIT;
-
-  it("ta part = ce que le pool ne recevra pas, arrondi en faveur de ta part", function () {
-    expect(shareToLock(supply, 95n)).to.equal(supply / 20n);
-    expect(shareToLock(supply, 100n)).to.equal(0n);
-    expect(shareToLock(999n, 95n)).to.equal(50n); // le pool reçoit 949 (arrondi inférieur)
-  });
-
-  it("part bloquée : le pool reçoit tout le reste, même si tokenPercent a changé depuis", function () {
-    for (const tokenPercent of [95n, 90n, 100n]) {
-      expect(poolShare({ tokenPercent, vestingEnabled: true, lockConfirmed: true, lockCommand: "x" })).to.deep.equal({
-        poolPercent: 100n,
-        mode: "locked",
-      });
-    }
-  });
-
-  it("blocage activé mais pas encore fait : refuse d'ouvrir le pool", function () {
-    expectInvalid(
-      () => poolShare({ tokenPercent: 95n, vestingEnabled: true, lockConfirmed: false, lockCommand: "npm run lock:mainnet" }),
-      /Bloque d'abord ta part : npm run lock:mainnet/,
-    );
-  });
-
-  it("part bloquée : le pool reçoit l'offre moins ta part, même si des tokens libérés sont revenus", function () {
-    const share = supply / 20n;
-    expect(poolBaseAmount({ mode: "locked", totalSupply: supply, lockedAmount: share, balance: supply - share + 123n })).to.equal(
-      supply - share,
-    );
-    expect(poolBaseAmount({ mode: "unlocked", totalSupply: supply, lockedAmount: 0n, balance: supply })).to.equal(supply);
-  });
-
-  it("sans part, ou blocage désactivé : tokenPercent s'applique tel quel", function () {
-    expect(poolShare({ tokenPercent: 100n, vestingEnabled: true, lockConfirmed: false, lockCommand: "x" })).to.deep.equal({
-      poolPercent: 100n,
-      mode: "none",
+describe("Répartition de l'offre et chiffres de la courbe", function () {
+  it("courbe + réserve + ta part = offre, à l'unité près (ta part prend les arrondis)", function () {
+    expect(splitSupply(1_000_000_000n, 87n, 3n)).to.deep.equal({
+      curveWholeTokens: 870_000_000n,
+      communityWholeTokens: 30_000_000n,
+      vestingWholeTokens: 100_000_000n,
     });
-    expect(poolShare({ tokenPercent: 95n, vestingEnabled: false, lockConfirmed: false, lockCommand: "x" })).to.deep.equal({
-      poolPercent: 95n,
-      mode: "unlocked",
+    expect(splitSupply(999n, 87n, 3n)).to.deep.equal({ curveWholeTokens: 869n, communityWholeTokens: 29n, vestingWholeTokens: 101n });
+    expect(splitSupply(1_000n, 97n, 3n).vestingWholeTokens).to.equal(0n);
+    expect(splitSupply(1_000n, 100n, 0n)).to.deep.equal({ curveWholeTokens: 1_000n, communityWholeTokens: 0n, vestingWholeTokens: 0n });
+  });
+
+  it("config par défaut : ≈ 62 % vendus, ≈ 25 % au pool, 0,5 % ≈ 0,0097 ETH, capitalisation ≈ 1,93 puis ≈ 12,06 ETH", function () {
+    const plan = buildCurvePlan({
+      supplyWholeTokens: 1_000_000_000n,
+      split: splitSupply(1_000_000_000n, 87n, 3n),
+      virtualEthWei: parseEther("2"),
+      targetEthWei: parseEther("3"),
     });
+    const supply = 1_000_000_000n * UNIT;
+    expect((plan.soldTokens * 1000n) / supply).to.equal(621n);
+    expect((plan.lpTokens * 1000n) / supply).to.equal(248n);
+    expect(plan.soldTokens + plan.lpTokens <= plan.curveAmount).to.equal(true);
+    expect(plan.vestingAmount).to.equal(supply / 10n);
+    expect(plan.communityAmount).to.equal((supply * 3n) / 100n);
+    expect(plan.halfPercentCostWei / 10n ** 14n).to.equal(97n); // 0,0097 ETH
+    expect(plan.startFdvWei / 10n ** 16n).to.equal(193n); // 1,93 ETH
+    expect(plan.poolFdvWei / 10n ** 16n).to.equal(1206n); // 12,06 ETH
+    // Prix multiplié par (V + E)² / V² entre le début et la fin : 6,25 avec 2 et 3 ETH.
+    expect((plan.endPriceWei * 100n) / plan.startPriceWei).to.equal(625n);
+  });
+
+  it("refuse les combinaisons que le contrat refuserait", function () {
+    expect(curveReserves(0n, 1n, 1n)).to.equal(undefined);
+    expect(curveReserves(10n ** 25n, parseEther("2"), parseEther("3"))).to.not.equal(undefined);
+    expect(curveReserves(10n ** 24n, parseEther("2"), parseEther("3"))).to.equal(undefined); // moins de 10^6 unités par wei
+    expect(curveReserves(10n ** 23n, parseEther("2"), parseEther("1000000"))).to.equal(undefined);
+  });
+
+  it("affiche un délai lisible", function () {
+    expect(formatDelay(1_000n + 3n * 3600n + 5n * 60n, 1_000n)).to.equal("dans 3 h 05 min");
+    expect(formatDelay(1_000n + 2n * 86_400n + 4n * 3600n, 1_000n)).to.equal("dans 2 j 4 h");
+    expect(formatDelay(1_000n, 1_000n + 720n)).to.equal("passée depuis 12 min");
   });
 });
 
@@ -217,18 +258,6 @@ describe("Réserve communauté", function () {
     expectInvalid(() => validateCommunityParams({ ...valid, beneficiary: "0x1234" }, deployer, 87n), /pas une adresse valide/);
   });
 
-  it("pool + réserve + ta part = offre, à l'unité près (arrondis inférieurs, ta part prend le reste)", function () {
-    const supply = 1_000_000_000n * UNIT;
-    expect(communityShare(supply, 3n)).to.equal(30_000_000n * UNIT);
-    expect(shareToLock(supply, 87n, 3n)).to.equal(100_000_000n * UNIT);
-    expect(shareToLock(supply, 97n, 3n)).to.equal(0n);
-    // Offre non divisible : pool 869, réserve 29, ta part 101 (= 999 − 869 − 29).
-    expect(communityShare(999n, 3n)).to.equal(29n);
-    expect(shareToLock(999n, 87n, 3n)).to.equal(101n);
-    const pool = poolBaseAmount({ mode: "locked", totalSupply: 999n, lockedAmount: 101n, balance: 898n, communityAmount: 29n });
-    expect(pool).to.equal(869n);
-    expect(pool).to.equal((999n * 87n) / 100n);
-  });
 });
 
 describe("Paramètres du blocage (vesting)", function () {
@@ -254,15 +283,6 @@ describe("Paramètres du blocage (vesting)", function () {
     expectInvalid(() => validateVestingParams({ ...valid, cliffDays: -1 }, deployer), /cliffDays/);
     // Au moins un jour : rien ne doit pouvoir sortir du contrat avant l'ouverture du pool.
     expectInvalid(() => validateVestingParams({ ...valid, cliffDays: 0 }, deployer), /entre 1 et/);
-  });
-
-  it("refuse de remplir un contrat déjà déployé dont la falaise est passée ou imminente", function () {
-    const vesting = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
-    const start = 1_000_000n;
-    const cliffSeconds = 90n * 86_400n;
-    expect(() => assertCliffAhead({ start, cliffSeconds, now: start + 86_400n, vesting })).to.not.throw();
-    expectInvalid(() => assertCliffAhead({ start, cliffSeconds, now: start + 100n * 86_400n, vesting }), /falaise/);
-    expectInvalid(() => assertCliffAhead({ start, cliffSeconds, now: start + cliffSeconds - 60n, vesting }), /moins d'une heure/);
   });
 
   it("exige la casse d'origine d'un autre bénéficiaire : une faute de frappe ne passe pas", function () {
@@ -355,38 +375,8 @@ describe("Journal du lancement", function () {
   });
 });
 
-describe("Plan de liquidité", function () {
+describe("Affichage", function () {
   const supply = 1_000_000_000n * UNIT;
-
-  it("avec 100 % dans le pool, la capitalisation de départ égale l'ETH apporté", function () {
-    const plan = buildLiquidityPlan({
-      deployerTokenBalance: supply,
-      tokenTotalSupply: supply,
-      tokenPercent: 100n,
-      ethAmount: 500_000_000_000_000_000n,
-    });
-    expect(plan.tokenAmount).to.equal(supply);
-    expect(plan.keptTokens).to.equal(0n);
-    expect(plan.impliedFdvWei).to.equal(500_000_000_000_000_000n);
-  });
-
-  it("avec 50 % dans le pool, la capitalisation de départ double", function () {
-    const plan = buildLiquidityPlan({
-      deployerTokenBalance: supply,
-      tokenTotalSupply: supply,
-      tokenPercent: 50n,
-      ethAmount: 500_000_000_000_000_000n,
-    });
-    expect(plan.keptTokens).to.equal(supply / 2n);
-    expect(plan.impliedFdvWei).to.equal(1_000_000_000_000_000_000n);
-  });
-
-  it("refuse un solde vide", function () {
-    expectInvalid(
-      () => buildLiquidityPlan({ deployerTokenBalance: 0n, tokenTotalSupply: supply, tokenPercent: 100n, ethAmount: 1n }),
-      /solde/,
-    );
-  });
 
   it("formate les montants sans perte", function () {
     expect(formatTokenAmount(supply)).to.equal(new Intl.NumberFormat("fr-CA").format(1_000_000_000n));

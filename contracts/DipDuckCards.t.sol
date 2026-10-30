@@ -919,9 +919,9 @@ contract DipDuckCardsTest {
         require(_status(cards, a) == 1 && _status(cards, b) == 2, "2/3 pile approuvee, moins refusee");
     }
 
-    function test_QuorumIsMax25Or5Percent() public {
-        require(cards.quorumFor(0) == 25 && cards.quorumFor(500) == 25 && cards.quorumFor(501) == 26, "quorum");
-        require(cards.quorumFor(1000) == 50 && cards.quorumFor(3333) == 167, "5 % arrondi au-dessus");
+    function test_QuorumIsMax25Or10Percent() public {
+        require(cards.quorumFor(0) == 25 && cards.quorumFor(250) == 25 && cards.quorumFor(251) == 26, "quorum");
+        require(cards.quorumFor(1000) == 100 && cards.quorumFor(3333) == 334, "10 % arrondi au-dessus");
         address[] memory voters = _voters(cards, 0x50000, 3);
         uint256 a = _proposeWith(cards, voters[0], NEW_CHARITY);
         uint256 b = _proposeWith(cards, voters[1], address(0xC4));

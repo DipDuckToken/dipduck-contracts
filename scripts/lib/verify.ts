@@ -19,7 +19,7 @@ export function manualVerifyCommand(networkName: string, target: VerifyTarget): 
   const args = target.constructorArgs
     .map((arg) =>
       Array.isArray(arg)
-        ? `'${JSON.stringify(arg)}'`
+        ? `'${JSON.stringify(arg, (_, value: unknown) => (typeof value === "bigint" ? value.toString() : value))}'`
         : typeof arg === "string" && !arg.startsWith("0x")
           ? `"${arg}"`
           : String(arg),

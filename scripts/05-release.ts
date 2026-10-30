@@ -30,11 +30,6 @@ async function release(connection: NetworkConnection, profile: NetworkProfile): 
   const entries: (JournaledTx | undefined)[] = [
     record.token,
     record.vesting,
-    record.lock,
-    record.community,
-    record.seeder,
-    record.approval,
-    record.liquidity,
     record.nft,
     record.game,
   ];

@@ -7,7 +7,7 @@ import type { TokenParams } from "./validation.ts";
 
 /** Noms complets des contrats, utilisés aussi pour la vérification sur Blockscout. */
 export const TOKEN_CONTRACT = "contracts/MemeToken.sol:MemeToken";
-export const SEEDER_CONTRACT = "contracts/PoolSeeder.sol:PoolSeeder";
+export const CURVE_CONTRACT = "contracts/LaunchCurve.sol:LaunchCurve";
 export const VESTING_CONTRACT = "contracts/TokenVesting.sol:TokenVesting";
 export const NFT_CONTRACT = "contracts/DipDuckCards.sol:DipDuckCards";
 export const GAME_CONTRACT = "contracts/DipDuckGame.sol:DipDuckGame";
@@ -38,11 +38,11 @@ export function nftConstructorArgs(
 
 /**
  * Arguments du constructeur de DipDuckGame, dans l'ordre : flux, jours des baisses, bonus,
- * temps minimaux historiques, premier jour évalué, prix récents.
+ * temps minimaux historiques, premier jour évalué, prix récents, flux de secours (0 = aucun).
  */
 export function gameConstructorArgs(
-  game: Pick<GameRecord, "feed" | "dipDays" | "dipBonus" | "histMinSeconds" | "detectFrom" | "recentPrices">,
-): [string, number[], number[], number[], number, bigint[]] {
+  game: Pick<GameRecord, "feed" | "dipDays" | "dipBonus" | "histMinSeconds" | "detectFrom" | "recentPrices" | "backupFeed">,
+): [string, number[], number[], number[], number, bigint[], string] {
   return [
     game.feed,
     [...game.dipDays],
@@ -50,6 +50,49 @@ export function gameConstructorArgs(
     [...game.histMinSeconds],
     game.detectFrom,
     game.recentPrices.map((price) => BigInt(price)),
+    game.backupFeed ?? ZeroAddress,
+  ];
+}
+
+/** Paramètres de LaunchCurve.Config, dans l'ordre du contrat (montants de tokens en tokens entiers). */
+export type CurveConfigTuple = [bigint, string, bigint, string, bigint, bigint, bigint, bigint, string, string];
+
+/**
+ * Arguments du constructeur de LaunchCurve : nom, symbole, puis Config (offre, blocage et sa part,
+ * Safe communauté et sa réserve, ETH virtuel, cible, heure d'ouverture, factory, WETH).
+ */
+export function curveConstructorArgs(
+  token: Pick<
+    TokenRecord,
+    | "name"
+    | "symbol"
+    | "supplyWholeTokens"
+    | "vesting"
+    | "vestingWholeTokens"
+    | "community"
+    | "communityWholeTokens"
+    | "virtualEthWei"
+    | "targetEthWei"
+    | "openAt"
+    | "factory"
+    | "weth"
+  >,
+): [string, string, CurveConfigTuple] {
+  return [
+    token.name,
+    token.symbol,
+    [
+      BigInt(token.supplyWholeTokens),
+      token.vesting,
+      BigInt(token.vestingWholeTokens),
+      token.community,
+      BigInt(token.communityWholeTokens),
+      BigInt(token.virtualEthWei),
+      BigInt(token.targetEthWei),
+      BigInt(token.openAt),
+      token.factory,
+      token.weth,
+    ],
   ];
 }
 
@@ -60,7 +103,10 @@ export function vestingConstructorArgs(
   return [vesting.beneficiary, BigInt(vesting.start), BigInt(vesting.durationSeconds), BigInt(vesting.cliffSeconds)];
 }
 
-/** Arguments du constructeur de MemeToken, dans l'ordre : nom, symbole, offre, factory, WETH. */
+/**
+ * Arguments du constructeur de MemeToken, dans l'ordre : nom, symbole, offre, factory, WETH.
+ * Le token est créé par la courbe avec ces arguments : ils servent à le vérifier sur Blockscout.
+ */
 export function constructorArgs(params: TokenParams): [string, string, bigint, string, string] {
   return [params.name, params.symbol, params.supply, params.factory ?? ZeroAddress, params.weth ?? ZeroAddress];
 }
@@ -81,13 +127,15 @@ export interface DeploymentEstimate {
   maxCostWei: bigint;
 }
 
-export async function estimateTokenDeployment(
+/** Coût maximal estimé d'un déploiement (gas estimé + marge, au prix du gas actuel). */
+export async function estimateDeployment(
   ethers: HardhatEthers,
   deployer: Signer,
-  params: TokenParams,
+  contract: string,
+  args: unknown[],
 ): Promise<DeploymentEstimate> {
-  const factory = await ethers.getContractFactory(TOKEN_CONTRACT, deployer);
-  const tx = await factory.getDeployTransaction(...constructorArgs(params));
+  const factory = await ethers.getContractFactory(contract, deployer);
+  const tx = await factory.getDeployTransaction(...args);
   const gas = await ethers.provider.estimateGas({ ...tx, from: await deployer.getAddress() });
   const fees = await ethers.provider.getFeeData();
   const pricePerGas = fees.maxFeePerGas ?? fees.gasPrice ?? 0n;
