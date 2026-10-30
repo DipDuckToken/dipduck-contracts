@@ -8,6 +8,13 @@ export interface TokenParams {
   symbol: string;
   /** Offre en tokens entiers. */
   supply: bigint;
+  /**
+   * Factory et WETH Uniswap v2 : le token crée sa paire au déploiement et y attache
+   * la limite anti-bot des 24 premières heures. Absents = pas de paire, pas de limite
+   * (testnet sans Uniswap, tests).
+   */
+  factory?: string;
+  weth?: string;
 }
 
 export interface LiquidityParams {
@@ -167,7 +174,7 @@ export function validateCommunityParams(
   const requested = params.beneficiary.trim();
   let beneficiary: string | undefined;
   if (problems.length === 0 && params.percent > 0) {
-    const advice = "utilise un wallet neuf, dédié à la communauté, dont tu gardes la clé";
+    const advice = "utilise un Safe 2 sur 3 dédié à la communauté (app.safe.global)";
     if (requested === "") {
       problems.push(`community.beneficiary est obligatoire quand community.percent > 0 : ${advice}`);
     } else {
@@ -196,8 +203,22 @@ export function validateCommunityParams(
   return { percent: BigInt(params.percent), beneficiary: params.percent > 0 ? beneficiary : undefined };
 }
 
-export function validateVestingParams(params: VestingParams, deployer: string): ValidatedVesting {
+/**
+ * `requireSeparateWallet` (mainnet) : la part bloquée doit aller à un wallet fondateur
+ * à part (Ledger), jamais au wallet de déploiement dont la clé est sur le PC.
+ */
+export function validateVestingParams(
+  params: VestingParams,
+  deployer: string,
+  options: { requireSeparateWallet?: boolean } = {},
+): ValidatedVesting {
   const problems: string[] = [];
+  if (options.requireSeparateWallet === true && params.beneficiary.trim() === "") {
+    problems.push(
+      "vesting.beneficiary est obligatoire sur le mainnet : mets l'adresse de ton wallet fondateur (Ledger), " +
+        "pas celle du wallet de déploiement",
+    );
+  }
   if (!Number.isInteger(params.durationDays) || params.durationDays < 1 || params.durationDays > MAX_VESTING_DAYS) {
     problems.push(`vesting.durationDays doit être un nombre entier de jours entre 1 et ${MAX_VESTING_DAYS}`);
   }
@@ -213,6 +234,8 @@ export function validateVestingParams(params: VestingParams, deployer: string): 
       const checksummed = hasChecksumCase(requested);
       if (beneficiary === ZeroAddress || beneficiary === getAddress(DEAD_ADDRESS)) {
         problems.push("vesting.beneficiary ne peut être ni l'adresse 0 ni l'adresse morte : la part serait perdue");
+      } else if (options.requireSeparateWallet === true && beneficiary === getAddress(deployer)) {
+        problems.push("vesting.beneficiary doit être ton wallet fondateur (Ledger), pas le wallet de déploiement");
       } else if (!checksummed && beneficiary !== getAddress(deployer)) {
         // Tout en minuscules (ou majuscules), une faute de frappe passerait inaperçue.
         problems.push(
@@ -246,7 +269,7 @@ export interface NftCharity {
 export interface NftParams {
   /** Début du mint, date ISO en UTC (ex. "2026-12-01T20:00:00Z"). Vide = maintenant (testnet seulement). */
   mintStart: string;
-  /** Wallet des fondateurs ; vide = le wallet de déploiement. */
+  /** Wallet fondateur (Ledger) ; vide = le wallet de déploiement, testnet seulement. */
   founders: string;
   /** 2 à 5 fondations candidates au départ ; les détenteurs en proposent d'autres ensuite. */
   charities: readonly NftCharity[];
@@ -309,8 +332,19 @@ export function validateNftParams(
     }
   }
 
-  const founders =
-    params.founders.trim() === "" ? getAddress(deployer) : checkedAddress("nft.founders", params.founders, problems);
+  let founders: string | undefined;
+  if (params.founders.trim() === "") {
+    if (isMainnet) {
+      problems.push("nft.founders est obligatoire sur le mainnet : mets l'adresse de ton wallet fondateur (Ledger)");
+    } else {
+      founders = getAddress(deployer);
+    }
+  } else {
+    founders = checkedAddress("nft.founders", params.founders, problems);
+    if (isMainnet && founders === getAddress(deployer)) {
+      problems.push("nft.founders doit être ton wallet fondateur (Ledger), pas le wallet de déploiement");
+    }
+  }
 
   let community = options.community.trim() === "" ? "" : checkedAddress("community.beneficiary", options.community, problems);
   if (community === "") {

@@ -403,6 +403,7 @@ export async function deployTokenStep(ctx: StepContext, params: TokenParams): Pr
         name: params.name,
         symbol: params.symbol,
         supplyWholeTokens: params.supply.toString(),
+        ...(params.factory === undefined ? {} : { factory: params.factory, weth: params.weth }),
       }),
       save,
     );

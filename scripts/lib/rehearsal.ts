@@ -39,6 +39,9 @@ import type { TokenParams, ValidatedCommunity, ValidatedLiquidity, ValidatedVest
 import { VESTING_ABI, communityShare, poolBaseAmount, poolShare, readVestingStatus, shareToLock } from "./vesting.ts";
 import { assertSameAccount, localWallet } from "./wallet.ts";
 
+/** Lecture de la limite anti-bot du token (MemeToken). */
+const ANTI_BOT_ABI = ["function walletLimit() view returns (uint256)"] as const;
+
 export interface RehearsalReport {
   token: TokenRecord;
   seeder: SeederRecord;
@@ -48,6 +51,8 @@ export interface RehearsalReport {
   pool: PoolStatus;
   gasUsed: { token: bigint; seeder: bigint; seed: bigint };
   roundTrip: { ethIn: bigint; tokensBought: bigint; ethBack: bigint };
+  /** Gros achat (5 % de l'ETH du pool) : refusé à l'ouverture, accepté après 24 h. */
+  antiBot: { limitAtLaunch: bigint; bigBuyBlocked: boolean; bigBuyAfter24h: boolean };
   /** Présent quand une part est gardée et que le blocage est activé. */
   vesting?: {
     record: VestingRecord;
@@ -100,7 +105,7 @@ export async function runRehearsal(
   await assertUniswapV2Deployment(ethers.provider, uniswap);
 
   log("Déploiement du token…");
-  const token = await deployTokenStep(ctx, input.token);
+  const token = await deployTokenStep(ctx, { ...input.token, factory: uniswap.factory, weth: uniswap.weth });
   const tokenContract = new Contract(token.address, ERC20_ABI, deployer);
   const totalSupply = (await tokenContract.totalSupply()) as bigint;
 
@@ -181,7 +186,8 @@ export async function runRehearsal(
   }
   const deadline = BigInt(latest.timestamp) + TX_DEADLINE_SECONDS;
 
-  const ethIn = plan.ethAmount / 100n > 0n ? plan.ethAmount / 100n : 1n;
+  // Petit achat (0,2 % de l'ETH du pool) : sous la limite anti-bot de la première heure.
+  const ethIn = plan.ethAmount / 500n > 0n ? plan.ethAmount / 500n : 1n;
   const buyPath = [uniswap.weth, token.address];
   const [, expectedTokens] = (await router.getAmountsOut(ethIn, buyPath)) as [bigint, bigint];
   await (await router.swapExactETHForTokens(expectedTokens, buyPath, buyer.address, deadline, { value: ethIn })).wait();
@@ -203,6 +209,28 @@ export async function runRehearsal(
   const ethBack = (await ethers.provider.getBalance(buyer.address)) - ethBefore + (sellReceipt?.fee ?? 0n);
   if (ethBack !== expectedEth) {
     throw new LaunchError(`La revente a rendu ${ethBack} wei au lieu de ${expectedEth}.`);
+  }
+
+  log("Anti-bot : un gros achat doit être refusé à l'ouverture, puis accepté après 24 h…");
+  const antiBotToken = new Contract(token.address, ANTI_BOT_ABI, ethers.provider);
+  const limitAtLaunch = (await antiBotToken.walletLimit()) as bigint;
+  const bigIn = plan.ethAmount / 20n > 0n ? plan.ethAmount / 20n : 1n;
+  const bigBuy = async () => {
+    const block = await ethers.provider.getBlock("latest");
+    const until = BigInt(block?.timestamp ?? 0) + TX_DEADLINE_SECONDS;
+    return await router.swapExactETHForTokens.staticCall(0n, buyPath, buyer.address, until, { value: bigIn }).then(
+      () => true,
+      () => false,
+    );
+  };
+  const bigBuyBlocked = !(await bigBuy());
+  await networkHelpers.time.increase(24 * 60 * 60);
+  const bigBuyAfter24h = await bigBuy();
+  if (!bigBuyBlocked || !bigBuyAfter24h) {
+    throw new LaunchError(
+      `Anti-bot inattendu : gros achat ${bigBuyBlocked ? "refusé" : "accepté"} à l'ouverture, ` +
+        `${bigBuyAfter24h ? "accepté" : "refusé"} après 24 h.`,
+    );
   }
 
   // En dernier (le temps avancé ne concerne que cette copie locale) : la part
@@ -255,5 +283,6 @@ export async function runRehearsal(
       seed: await gasUsedBy(ethers, liquidity.txHash),
     },
     roundTrip: { ethIn, tokensBought, ethBack },
+    antiBot: { limitAtLaunch, bigBuyBlocked, bigBuyAfter24h },
   };
 }

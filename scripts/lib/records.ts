@@ -46,6 +46,9 @@ export interface TokenRecord extends JournaledTx {
   name: string;
   symbol: string;
   supplyWholeTokens: string;
+  /** Factory et WETH Uniswap v2 passés au constructeur (absents = pas de limite anti-bot). */
+  factory?: string;
+  weth?: string;
 }
 
 export interface SeederRecord extends JournaledTx {

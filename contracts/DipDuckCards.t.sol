@@ -35,7 +35,16 @@ contract DipDuckCardsHarness is DipDuckCards {
         pure
         returns (uint8)
     {
-        Card memory card = Card(name, address(0), 0, lucky, mood, element, 0);
+        Card memory card = Card(name, address(0), 0, lucky, mood, element, 0, false);
+        return _pick(card, seed, t);
+    }
+
+    function pickTrophyFor(bytes32 name, uint8 mood, uint8 element, uint16 lucky, bytes32 seed, uint256 t)
+        external
+        pure
+        returns (uint8)
+    {
+        Card memory card = Card(name, address(0), 0, lucky, mood, element, 0, true);
         return _pick(card, seed, t);
     }
 
@@ -44,7 +53,7 @@ contract DipDuckCardsHarness is DipDuckCards {
         pure
         returns (uint256)
     {
-        Card memory card = Card(name, address(0), 0, lucky, mood, element, 0);
+        Card memory card = Card(name, address(0), 0, lucky, mood, element, 0, false);
         return _boost(card, t, i);
     }
 
@@ -60,9 +69,9 @@ contract DipDuckCardsHarness is DipDuckCards {
 /// @dev Destinataire qui refuse l'ETH : son retrait échoue sans bloquer les autres.
 contract RejectEth {}
 
-/// @notice Tests des cartes de collection Dip Duck : mint, réserve, commit-reveal,
-///         attributs et secrets, vote de la fondation, propositions (dépôt, snapshot, 2/3,
-///         quorum, plafond, expiration, réserve), versements en mode pull, métadonnées.
+/// @notice Tests des cartes de collection Dip Duck : mint, édition Trophée (réserve),
+///         commit-reveal, attributs et secrets, vote de la fondation, propositions (dépôt,
+///         snapshot, 2/3, quorum, plafond, expiration, réserve), versements en mode pull, métadonnées.
 contract DipDuckCardsTest {
     CardsVm private constant vm = CardsVm(address(uint160(uint256(keccak256("hevm cheat code")))));
 
@@ -102,9 +111,11 @@ contract DipDuckCardsTest {
     function test_MintStoresChoicesAndStartsAtOne() public {
         _mintAs(ALICE, 2);
         require(cards.totalMinted() == 2 && cards.ownerOf(1) == ALICE && cards.ownerOf(2) == ALICE, "cartes 1 et 2 a Alice");
-        (bytes32 name, uint8 mood, uint8 element, uint16 lucky, uint64 commitBlock, bool revealed) = cards.cardOf(1);
+        (bytes32 name, uint8 mood, uint8 element, uint16 lucky, uint64 commitBlock, bool revealed, bool trophy) =
+            cards.cardOf(1);
         require(name == NAME && mood == 1 && element == 2 && lucky == 7, "choix enregistres");
         require(commitBlock == 1_000 && !revealed, "bloc d'engagement, pas encore revelee");
+        require(!trophy, "carte achetee : pas un Trophee");
         require(cards.mintedBy(ALICE) == 2, "compteur du wallet");
     }
 
@@ -174,27 +185,137 @@ contract DipDuckCardsTest {
         vm.prank(BOB);
         vm.expectRevert(abi.encodeWithSelector(DipDuckCards.SoldOut.selector));
         cards.mint{value: PRICE}(NAME, 0, 0, 0, 1);
-        // La réserve reste disponible après l'épuisement de l'offre publique.
-        vm.prank(COMMUNITY);
-        cards.mintReserved(BOB, 111, "Winner", 0, 0, 0);
+        // La réserve (cartes Trophée) reste disponible après l'épuisement de l'offre publique.
+        _mintAllTrophies();
         require(cards.totalMinted() == cards.MAX_SUPPLY(), "3333 cartes au total");
     }
 
-    // --- Réserve ----------------------------------------------------------------
+    // --- Édition Trophée (réserve) ---------------------------------------------
 
-    function test_ReserveOnlyByCommunityAndCapped() public {
+    function _trophy(address to) private {
+        vm.prank(COMMUNITY);
+        cards.mintTrophy(to, "Winner", 0, 0, 0);
+    }
+
+    function _expectTrophyRefused(address to, bytes4 selector) private {
+        vm.prank(COMMUNITY);
+        vm.expectRevert(abi.encodeWithSelector(selector));
+        cards.mintTrophy(to, "Winner", 0, 0, 0);
+    }
+
+    function _mintAllTrophies() private {
+        for (uint256 i = 0; i < 111; i++) {
+            _trophy(address(uint160(0x50000 + i)));
+        }
+    }
+
+    function _isTrophy(uint256 id) private view returns (bool trophy) {
+        (,,,,,, trophy) = cards.cardOf(id);
+    }
+
+    function test_TrophyOnlyByCommunityAndFree() public {
         vm.prank(ALICE);
         vm.expectRevert(abi.encodeWithSelector(DipDuckCards.OnlyCommunity.selector));
-        cards.mintReserved(ALICE, 1, NAME, 0, 0, 0);
+        cards.mintTrophy(ALICE, NAME, 0, 0, 0);
+        _trophy(BOB);
+        require(cards.ownerOf(1) == BOB && cards.balanceOf(BOB) == 1 && _isTrophy(1), "une carte Trophee a Bob");
+        require(cards.reservedMinted() == 1 && cards.trophyReceived(BOB), "comptee dans la reserve");
+        require(cards.mintedBy(BOB) == 0, "hors limite de 10 cartes achetees");
+        require(address(cards).balance == 0 && cards.roundCommunity(0) == 0, "gratuite, aucune cagnotte");
+    }
+
+    function test_TrophyCappedAtReserved() public {
+        _mintAllTrophies();
+        require(cards.reservedMinted() == 111 && cards.totalMinted() == 111, "111 cartes Trophee");
+        _expectTrophyRefused(BOB, DipDuckCards.SoldOut.selector);
+        // L'offre publique n'est pas entamée par la réserve.
+        _mintAs(ALICE, 10);
+        require(cards.totalMinted() == 121, "mint public intact");
+    }
+
+    function test_TrophyOncePerWalletForLife() public {
+        _trophy(BOB);
+        _expectTrophyRefused(BOB, DipDuckCards.TrophyNotAllowed.selector);
+        // Même après avoir donné sa carte, le wallet n'en reçoit plus.
+        vm.prank(BOB);
+        cards.transferFrom(BOB, ALICE, 1);
+        require(cards.balanceOf(BOB) == 0, "Bob n'a plus de carte");
+        _expectTrophyRefused(BOB, DipDuckCards.TrophyNotAllowed.selector);
+        require(cards.reservedMinted() == 1, "une seule frappee");
+    }
+
+    function test_TrophyOnlyForWalletsWithTwoCardsOrLess() public {
+        _mintAs(ALICE, 2);
+        _trophy(ALICE); // 2 cartes : accepté
+        require(cards.balanceOf(ALICE) == 3 && _isTrophy(3), "Trophee recu avec 2 cartes");
+        _mintAs(BOB, 3);
+        _expectTrophyRefused(BOB, DipDuckCards.TrophyNotAllowed.selector); // 3 cartes : refusé
+        vm.prank(BOB);
+        cards.transferFrom(BOB, ALICE, 4);
+        _trophy(BOB); // redescendu à 2 cartes : accepté
+        require(cards.balanceOf(BOB) == 3, "Trophee recu apres etre redescendu a 2");
+    }
+
+    function test_TrophyNeverToCommunity() public {
+        _expectTrophyRefused(COMMUNITY, DipDuckCards.TrophyNotAllowed.selector);
         vm.prank(COMMUNITY);
-        cards.mintReserved(BOB, 100, "Winner", 0, 0, 0);
+        vm.expectRevert(); // ERC721InvalidReceiver(0)
+        cards.mintTrophy(address(0), "Winner", 0, 0, 0);
         vm.prank(COMMUNITY);
-        vm.expectRevert(abi.encodeWithSelector(DipDuckCards.SoldOut.selector));
-        cards.mintReserved(BOB, 12, "Winner", 0, 0, 0);
-        vm.prank(COMMUNITY);
-        cards.mintReserved(BOB, 11, "Winner", 0, 0, 0);
-        require(cards.reservedMinted() == 111 && cards.balanceOf(BOB) == 111, "111 cartes de reserve");
-        require(address(cards).balance == 0, "la reserve est gratuite");
+        vm.expectRevert(abi.encodeWithSelector(DipDuckCards.InvalidName.selector));
+        cards.mintTrophy(BOB, "<b>", 0, 0, 0);
+        require(cards.reservedMinted() == 0 && !cards.trophyReceived(BOB), "rien de frappe");
+    }
+
+    function test_TrophyDrawSkipsTheCommonestOptions() public view {
+        uint256 n = 300;
+        uint256 crowns;
+        for (uint256 i = 0; i < n; i++) {
+            bytes32 seed = keccak256(abi.encode("trophee", i));
+            for (uint256 t = 0; t < 10; t++) {
+                uint8 floor = t == 6 || t == 7 ? 2 : 1;
+                require(cards.pickTrophyFor("Winner", 0, 0, 0, seed, t) >= floor, "jamais l'option la plus commune");
+            }
+            if (cards.pickTrophyFor("Winner", 1, 0, 0, seed, 2) == 3) crowns++;
+        }
+        // Les secrets s'appliquent aussi : courageux, couronne x1,5 (poids 90 sur 550 sans « none »).
+        require(crowns > (n * 12) / 100, "secrets actifs sur le Trophee");
+        // Graine nulle (carte Plain) : le plancher, ni plus ni moins.
+        for (uint256 t = 0; t < 10; t++) {
+            require(cards.pickTrophyFor("Winner", 0, 0, 0, 0, t) == (t == 6 || t == 7 ? 2 : 1), "Plain : plancher");
+            require(cards.pickFor("Winner", 0, 0, 0, 0, t) == 0, "Plain achetee : zero");
+        }
+    }
+
+    function test_TrophyDoesNotChangePaidDraws() public {
+        _trophy(BOB); // carte 1
+        _mintAs(ALICE, 1); // carte 2, même bloc
+        bytes32 hash = keccak256("bloc cible");
+        _rollPastTarget(1_000, hash);
+        uint256[] memory ids = _ids(1, 2);
+        cards.revealMany(ids);
+        (uint8[10] memory paid,) = cards.traitsOf(2);
+        bytes32 seed = keccak256(abi.encode(NAME, uint8(1), uint8(2), uint16(7), uint256(2), ALICE, hash));
+        for (uint256 t = 0; t < 10; t++) {
+            require(paid[t] == cards.pickFor(NAME, 1, 2, 7, seed, t), "carte achetee : tirage normal");
+        }
+        (uint8[10] memory trophy,) = cards.traitsOf(1);
+        bytes32 trophySeed = keccak256(abi.encode(bytes32("Winner"), uint8(0), uint8(0), uint16(0), uint256(1), BOB, hash));
+        for (uint256 t = 0; t < 10; t++) {
+            require(trophy[t] == cards.pickTrophyFor("Winner", 0, 0, 0, trophySeed, t), "Trophee : tirage a part");
+        }
+        require(!_isTrophy(2) && _isTrophy(1), "marque Trophee sur la seule carte de la reserve");
+    }
+
+    function test_PlainTrophyKeepsItsFloor() public {
+        _trophy(BOB);
+        vm.roll(1_000 + cards.REVEAL_DELAY() + 300);
+        cards.reveal(1);
+        (uint8[10] memory traits, bool revealed) = cards.traitsOf(1);
+        require(revealed, "revelee (Plain)");
+        for (uint256 t = 0; t < 10; t++) {
+            require(traits[t] == (t == 6 || t == 7 ? 2 : 1), "Plain Trophee : plancher du tirage");
+        }
     }
 
     // --- Commit-reveal ----------------------------------------------------------
@@ -247,9 +368,8 @@ contract DipDuckCardsTest {
     function test_RevealManyRevealsReadyCardsAndIgnoresTheRest() public {
         _mintAs(ALICE, 3); // cartes 1 à 3 au bloc 1000
         _rollPastTarget(1_000, keccak256("a"));
-        // Cartes 4 et 5 engagées maintenant (la réserve ne révèle rien au passage) : pas encore prêtes.
-        vm.prank(COMMUNITY);
-        cards.mintReserved(BOB, 2, "Winner", 0, 0, 0);
+        // Carte 4 engagée maintenant (la réserve ne révèle rien au passage) : pas encore prête.
+        _trophy(BOB);
         uint256[] memory ids = new uint256[](6);
         ids[0] = 1;
         ids[1] = 2;
@@ -873,14 +993,13 @@ contract DipDuckCardsTest {
         _proposeWith(cards, voters[1], NEW_CHARITY);
     }
 
-    function test_ReserveHeldByCommunityDoesNotVote() public {
-        vm.prank(COMMUNITY);
-        cards.mintReserved(COMMUNITY, 30, "Winner", 0, 0, 0);
-        _mintAs(ALICE, 1);
+    function test_CommunityDoesNotVote() public {
         vm.deal(COMMUNITY, 1 ether);
+        _mintAs(COMMUNITY, 2);
+        _mintAs(ALICE, 1);
         vm.startPrank(COMMUNITY);
         vm.expectRevert(abi.encodeWithSelector(DipDuckCards.CommunityCannotVote.selector));
-        cards.vote(_ids(1, 30), 0);
+        cards.vote(_ids(1, 2), 0);
         vm.expectRevert(abi.encodeWithSelector(DipDuckCards.CommunityCannotVote.selector));
         cards.propose{value: DEPOSIT}("X", NEW_CHARITY, URL, "d");
         vm.stopPrank();
@@ -888,14 +1007,41 @@ contract DipDuckCardsTest {
         uint256 id = _proposeWith(cards, ALICE, NEW_CHARITY);
         vm.prank(COMMUNITY);
         vm.expectRevert(abi.encodeWithSelector(DipDuckCards.CommunityCannotVote.selector));
-        cards.voteProposal(id, _ids(1, 30), true);
-        // Donnée à un gagnant, la carte vote normalement.
+        cards.voteProposal(id, _ids(1, 2), true);
+        // Données à quelqu'un d'autre, des cartes achetées votent normalement.
         vm.prank(COMMUNITY);
         cards.transferFrom(COMMUNITY, BOB, 1);
         vm.prank(BOB);
         cards.voteProposal(id, _ids(1, 1), true);
         vm.prank(BOB);
         cards.vote(_ids(1, 1), 0);
+    }
+
+    function test_TrophyNeverVotes() public {
+        _mintAs(BOB, 2); // cartes 1 et 2
+        _trophy(BOB); // carte 3
+        vm.deal(ALICE, 1 ether);
+        _mintAs(ALICE, 1); // carte 4
+        uint256 id = _proposeWith(cards, ALICE, NEW_CHARITY);
+        vm.startPrank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(DipDuckCards.NotEligible.selector, 3));
+        cards.vote(_ids(1, 3), 0);
+        vm.expectRevert(abi.encodeWithSelector(DipDuckCards.NotEligible.selector, 3));
+        cards.voteProposal(id, _ids(3, 3), true);
+        // Les cartes achetées du même wallet votent normalement.
+        cards.vote(_ids(1, 2), 0);
+        cards.voteProposal(id, _ids(1, 2), true);
+        vm.stopPrank();
+        require(cards.votesFor(0, 0) == 2, "2 voix, pas 3");
+        // Donnée à quelqu'un d'autre, la carte Trophée ne vote toujours pas.
+        vm.prank(BOB);
+        cards.transferFrom(BOB, ALICE, 3);
+        vm.startPrank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(DipDuckCards.NotEligible.selector, 3));
+        cards.vote(_ids(3, 3), 0);
+        vm.expectRevert(abi.encodeWithSelector(DipDuckCards.NotEligible.selector, 3));
+        cards.voteProposal(id, _ids(3, 3), true);
+        vm.stopPrank();
     }
 
     function test_ProposeRules() public {

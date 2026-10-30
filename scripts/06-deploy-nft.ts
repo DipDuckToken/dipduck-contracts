@@ -23,6 +23,7 @@ import { type NetworkProfile, explorerLink, resolveNetworkProfile } from "./lib/
 import { type JournaledTx, acquireLock, fileJournal } from "./lib/records.ts";
 import { type StepContext, deployNftStep } from "./lib/steps.ts";
 import { NFT_CONTRACT, nftConstructorArgs } from "./lib/token.ts";
+import { assertSafe } from "./lib/safe.ts";
 import { validateNftParams } from "./lib/validation.ts";
 import { manualVerifyCommand, verifyOnBlockscout } from "./lib/verify.ts";
 import { assertSameAccount, localWallet } from "./lib/wallet.ts";
@@ -74,7 +75,12 @@ async function deployNft(connection: NetworkConnection, profile: NetworkProfile)
       isMainnet: profile.isMainnet,
       now: BigInt(latest.timestamp),
     });
-    for (const address of [plan.founders, plan.community, ...plan.candidateWallets]) {
+    // Le wallet communauté est (sur le mainnet, doit être) un Safe 2 sur 3 : il reçoit 40 % des mints
+    // et frappe les cartes Trophée par une transaction signée à plusieurs.
+    if (profile.isMainnet || (await ethers.provider.getCode(plan.community)) !== "0x") {
+      await assertSafe(ethers.provider, plan.community, signer.address, "Le wallet communauté");
+    }
+    for (const address of [plan.founders, ...plan.candidateWallets]) {
       if ((await ethers.provider.getCode(address)) !== "0x") {
         throw new LaunchError(
           `${address} est un contrat sur cette chaîne : les versements partent vers des wallets ordinaires. Rien n'a été envoyé.`,
@@ -84,12 +90,12 @@ async function deployNft(connection: NetworkConnection, profile: NetworkProfile)
     const balance = await ethers.provider.getBalance(signer.address);
 
     heading(`Cartes NFT Dip Duck — ${profile.label}`);
-    row("Collection", "Dip Duck Cards (DDCARD) — 3 333 cartes dont 111 de réserve");
+    row("Collection", "Dip Duck Cards (DDCARD) — 3 333 cartes dont 111 Trophée (prix de concours, sans vote)");
     row("Prix du mint", "0,001 ETH, 10 cartes au maximum par wallet");
     row("Début du mint", formatDate(plan.mintStart));
     row("Périodes", "30 jours : chaque période a sa cagnotte et son vote ; rien n'est versé avant sa fin");
     row("Fondateurs (30 %)", plan.founders);
-    row("Communauté (40 %, réserve)", plan.community);
+    row("Communauté (40 %, Trophées)", plan.community);
     plan.candidateNames.forEach((name, i) =>
       row(
         i === 0 ? "Fondations de départ (30 %)" : "",

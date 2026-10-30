@@ -37,15 +37,20 @@ function expectInvalid(run: () => unknown, pattern: RegExp): void {
 }
 
 describe("Surface du contrat", function () {
-  it("n'expose que les 9 fonctions ERC-20 standard : aucune fonction d'administration", async function () {
+  it("n'expose que les 9 fonctions ERC-20 standard plus la lecture de l'anti-bot : aucune fonction d'administration", async function () {
     const artifact = await hre.artifacts.readArtifact("MemeToken");
     const abi = artifact.abi as Array<{ type: string; name?: string; stateMutability?: string }>;
 
-    const functions = abi.filter((item) => item.type === "function").map((item) => item.name).sort();
-    expect(functions).to.deep.equal(STANDARD_ERC20_FUNCTIONS);
+    const functions = abi.filter((item) => item.type === "function");
+    const antiBot = ["LIMIT_DURATION", "PAIR", "launchedAt", "walletLimit"];
+    expect(functions.map((item) => item.name).sort()).to.deep.equal([...STANDARD_ERC20_FUNCTIONS, ...antiBot].sort());
+    // L'anti-bot se lit seulement : rien ne permet de le modifier, le prolonger ou l'arrêter.
+    for (const name of antiBot) {
+      expect(functions.find((item) => item.name === name)?.stateMutability, name).to.equal("view");
+    }
 
     const events = abi.filter((item) => item.type === "event").map((item) => item.name).sort();
-    expect(events).to.deep.equal(["Approval", "Transfer"]);
+    expect(events).to.deep.equal(["Approval", "Launched", "Transfer"]);
 
     expect(abi.some((item) => item.type === "receive" || item.type === "fallback")).to.equal(false);
     const constructor = abi.find((item) => item.type === "constructor");
@@ -197,8 +202,8 @@ describe("Réserve communauté", function () {
     expectInvalid(() => validateCommunityParams({ ...valid, percent: 14 }, deployer, 87n), /dépasse 100/);
   });
 
-  it("exige un wallet neuf : ni vide, ni sans casse, ni 0, ni l'adresse morte, ni le déployeur", function () {
-    expectInvalid(() => validateCommunityParams({ ...valid, beneficiary: "" }, deployer, 87n), /obligatoire.*wallet neuf/);
+  it("exige un wallet dédié (Safe) : ni vide, ni sans casse, ni 0, ni l'adresse morte, ni le déployeur", function () {
+    expectInvalid(() => validateCommunityParams({ ...valid, beneficiary: "" }, deployer, 87n), /obligatoire.*Safe 2 sur 3/);
     expectInvalid(() => validateCommunityParams({ ...valid, beneficiary: wallet.toLowerCase() }, deployer, 87n), /majuscules/);
     expectInvalid(
       () => validateCommunityParams({ ...valid, beneficiary: "0x0000000000000000000000000000000000000000" }, deployer, 87n),

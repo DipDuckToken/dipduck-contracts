@@ -38,6 +38,7 @@ import { type CommunityRecord, type LockRecord, type VestingRecord, acquireLock,
 import { type StepContext, type VestingPlan, communityStep, deployVestingStep, lockStep } from "./lib/steps.ts";
 import { VESTING_CONTRACT, vestingConstructorArgs } from "./lib/token.ts";
 import { ERC20_ABI } from "./lib/uniswap.ts";
+import { assertSafe } from "./lib/safe.ts";
 import { validateCommunityParams, validateLiquidityParams, validateVestingParams } from "./lib/validation.ts";
 import { manualVerifyCommand, verifyOnBlockscout } from "./lib/verify.ts";
 import { assertCliffAhead, communityShare, readVestingStatus, shareToLock } from "./lib/vesting.ts";
@@ -189,7 +190,9 @@ async function lockShare(connection: NetworkConnection, profile: NetworkProfile)
       plan = planFromJournal(vesting);
       assertCliffAhead({ ...plan, now: BigInt(latest.timestamp), vesting: vesting.address });
     } else if (teamAmount > 0n) {
-      const config = validateVestingParams(launchConfig.vesting, signer.address);
+      const config = validateVestingParams(launchConfig.vesting, signer.address, {
+        requireSeparateWallet: profile.isMainnet,
+      });
       if ((await ethers.provider.getCode(config.beneficiary)) !== "0x") {
         throw new LaunchError(
           `Le bénéficiaire ${config.beneficiary} est un contrat sur cette chaîne : choisis l'adresse d'un wallet ` +
@@ -209,11 +212,11 @@ async function lockShare(connection: NetworkConnection, profile: NetworkProfile)
       if (recipient === undefined) {
         throw new LaunchError("community.beneficiary manque dans launch.config.ts. Rien n'a été envoyé.");
       }
-      if ((await ethers.provider.getCode(recipient)) !== "0x") {
-        throw new LaunchError(
-          `Le wallet communauté ${recipient} est un contrat sur cette chaîne : choisis un wallet neuf ordinaire, ` +
-            "dédié à la communauté, dont tu as la clé. Rien n'a été envoyé.",
-        );
+      if (profile.isMainnet) {
+        // Sur le mainnet, la réserve va dans un Safe 2 sur 3, jamais dans un wallet à clé unique.
+        await assertSafe(ethers.provider, recipient, signer.address, "Le wallet communauté");
+      } else if ((await ethers.provider.getCode(recipient)) !== "0x") {
+        await assertSafe(ethers.provider, recipient, signer.address, "Le wallet communauté");
       }
     }
 

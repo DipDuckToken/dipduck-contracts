@@ -2,6 +2,7 @@
 pragma solidity 0.8.34;
 
 import {MemeToken} from "./MemeToken.sol";
+import {MockPairFactory} from "./mocks/MockPairFactory.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
 /// @dev Sous-ensemble des cheatcodes du runner de tests Solidity de Hardhat
@@ -10,6 +11,8 @@ interface Vm {
     function expectRevert(bytes calldata revertData) external;
     function prank(address msgSender) external;
     function assume(bool condition) external;
+    function warp(uint256 newTimestamp) external;
+    function getNonce(address account) external view returns (uint64);
 }
 
 /// @notice Tests unitaires et de fuzzing du token. Toute fonction `test*`
@@ -22,7 +25,7 @@ contract MemeTokenTest {
     uint256 private constant SUPPLY = 1_000_000_000;
 
     function _deploy(uint256 wholeTokens) private returns (MemeToken) {
-        return new MemeToken("Test Token", "TEST", wholeTokens);
+        return new MemeToken("Test Token", "TEST", wholeTokens, address(0), address(0));
     }
 
     // --- Émission initiale ---------------------------------------------------
@@ -114,5 +117,107 @@ contract MemeTokenTest {
         (bool ok,) = address(token).call{value: 1}("");
         require(!ok, "le token ne doit pas accepter d'ETH");
         require(address(token).balance == 0, "aucun ETH ne doit rester sur le token");
+    }
+
+    // --- Anti-bot : limite par wallet pendant 24 h après l'ouverture du pool ---
+
+    address private constant WETH = address(0xE7);
+    address private constant BOT = address(0xB07);
+
+    function _launch() private returns (MemeToken token, address pair) {
+        MockPairFactory factory = new MockPairFactory();
+        token = new MemeToken("Test Token", "TEST", SUPPLY, address(factory), WETH);
+        pair = token.PAIR();
+        require(pair != address(0) && factory.getPair(address(token), WETH) == pair, "paire creee au deploiement");
+    }
+
+    function test_NoLimitBeforePoolOpens() public {
+        (MemeToken token,) = _launch();
+        require(token.launchedAt() == 0 && token.walletLimit() == type(uint256).max, "pas de limite avant le pool");
+        // blocage de la part et reserve communaute : envoyes avant l'ouverture, sans limite
+        require(token.transfer(address(0x7E57), (SUPPLY * UNIT) / 10), "10 % bloques");
+        require(token.transfer(address(0x5AFE), (SUPPLY * UNIT * 3) / 100), "3 % reserve");
+    }
+
+    function test_FirstTransferToPairStartsLimit() public {
+        (MemeToken token, address pair) = _launch();
+        vm.warp(1_000_000);
+        require(token.transfer(pair, (SUPPLY * UNIT * 87) / 100), "87 % dans le pool");
+        require(token.launchedAt() == 1_000_000, "ouverture notee");
+        require(token.walletLimit() == (SUPPLY * UNIT) / 200, "0,5 % la premiere heure");
+        vm.warp(1_000_000 + 3 hours);
+        require(token.transfer(pair, 1), "un second envoi ne change pas l'ouverture");
+        require(token.launchedAt() == 1_000_000, "ouverture inchangee");
+    }
+
+    function test_LimitStepsThenDisappears() public {
+        (MemeToken token, address pair) = _launch();
+        vm.warp(1_000_000);
+        require(token.transfer(pair, (SUPPLY * UNIT * 87) / 100), "pool");
+        uint256 total = SUPPLY * UNIT;
+
+        vm.prank(pair);
+        require(token.transfer(BOT, total / 200), "0,5 % pile accepte");
+        vm.prank(pair);
+        vm.expectRevert(abi.encodeWithSelector(MemeToken.WalletLimit.selector, total / 200));
+        token.transfer(BOT, 1);
+
+        vm.warp(1_000_000 + 1 hours);
+        require(token.walletLimit() == total / 100, "1 % apres 1 h");
+        vm.prank(pair);
+        require(token.transfer(BOT, total / 200), "jusqu'a 1 %");
+        vm.prank(pair);
+        vm.expectRevert(abi.encodeWithSelector(MemeToken.WalletLimit.selector, total / 100));
+        token.transfer(BOT, 1);
+
+        vm.warp(1_000_000 + 6 hours);
+        require(token.walletLimit() == total / 50, "2 % apres 6 h");
+        vm.prank(pair);
+        require(token.transfer(BOT, total / 100), "jusqu'a 2 %");
+        vm.prank(pair);
+        vm.expectRevert(abi.encodeWithSelector(MemeToken.WalletLimit.selector, total / 50));
+        token.transfer(BOT, 1);
+
+        vm.warp(1_000_000 + 24 hours - 1);
+        require(token.walletLimit() == total / 50, "toujours 2 % juste avant 24 h");
+        vm.warp(1_000_000 + 24 hours);
+        require(token.walletLimit() == type(uint256).max, "plus de limite apres 24 h");
+        vm.prank(pair);
+        require(token.transfer(BOT, total / 10), "achat libre apres 24 h");
+    }
+
+    function test_LimitAlsoAppliesBetweenWallets() public {
+        (MemeToken token, address pair) = _launch();
+        require(token.transfer(address(0xA11CE), (SUPPLY * UNIT) / 10), "avant l'ouverture : libre");
+        require(token.transfer(pair, (SUPPLY * UNIT * 87) / 100), "pool");
+        vm.prank(address(0xA11CE));
+        vm.expectRevert(abi.encodeWithSelector(MemeToken.WalletLimit.selector, (SUPPLY * UNIT) / 200));
+        token.transfer(BOT, (SUPPLY * UNIT) / 200 + 1);
+        // vendre au pool reste toujours possible, quelle que soit la quantite
+        vm.prank(address(0xA11CE));
+        require(token.transfer(pair, (SUPPLY * UNIT) / 10), "vente au pool libre");
+    }
+
+    function test_ReusesPairCreatedByThirdParty() public {
+        MockPairFactory factory = new MockPairFactory();
+        // adresse du prochain contrat cree par ce test (nonce courant du contrat de test)
+        address predicted = _nextAddress(address(this));
+        factory.setPair(predicted, WETH, address(0xFA1C));
+        MemeToken token = new MemeToken("Test Token", "TEST", SUPPLY, address(factory), WETH);
+        require(address(token) == predicted, "prediction");
+        require(token.PAIR() == address(0xFA1C), "paire existante reprise, pas de blocage");
+    }
+
+    function test_NoFactoryMeansNoLimit() public {
+        MemeToken token = _deploy(SUPPLY);
+        require(token.PAIR() == address(0), "pas de paire");
+        require(token.transfer(BOT, (SUPPLY * UNIT) / 2), "transfert libre");
+        require(token.launchedAt() == 0 && token.walletLimit() == type(uint256).max, "jamais de limite");
+    }
+
+    function _nextAddress(address deployer) private view returns (address) {
+        uint256 nonce = vm.getNonce(deployer);
+        require(nonce > 0 && nonce < 128, "nonce hors plage");
+        return address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xd6), bytes1(0x94), deployer, uint8(nonce))))));
     }
 }

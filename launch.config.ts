@@ -32,9 +32,11 @@ export const launchConfig = {
     // Envoyée par npm run lock:mainnet, AVANT l'ouverture du pool, vers un wallet
     // public dédié : tout le monde voit son solde. 0 = pas de réserve.
     percent: 3,
-    // Wallet NEUF, dédié à la communauté : ni le wallet de déploiement, ni un contrat.
-    // Obligatoire si percent > 0. Colle-la avec ses majuscules et minuscules d'origine
-    // et garde bien sa clé : sans elle, la réserve est perdue.
+    // Safe 2 sur 3 dédié à la communauté (app.safe.global, réseau Robinhood Chain) :
+    // 3 propriétaires (ex. ton Ledger, un 2e wallet, une personne de confiance), 2 signatures
+    // pour chaque envoi. Le wallet de déploiement ne doit PAS en être propriétaire.
+    // Sur le mainnet, le script refuse d'envoyer si cette adresse n'est pas un vrai Safe.
+    // Obligatoire si percent > 0. Colle-la avec ses majuscules et minuscules d'origine.
     beneficiary: "",
   },
   vesting: {
@@ -51,8 +53,9 @@ export const launchConfig = {
     // À la falaise, la part correspondant au temps écoulé devient libérable d'un coup
     // (90 jours sur 900 = 10 % exactement), puis le reste se libère chaque seconde jusqu'à la fin.
     cliffDays: 90,
-    // Adresse qui recevra les tokens libérés. Vide = le wallet de déploiement (recommandé).
-    // Sinon, colle-la avec ses majuscules et minuscules d'origine, et vérifie-la caractère par caractère.
+    // Wallet FONDATEUR (Ledger) qui recevra les tokens libérés. Obligatoire sur le mainnet,
+    // et différent du wallet de déploiement (Rabby), qui ne garde rien après le lancement.
+    // Colle-la avec ses majuscules et minuscules d'origine, et vérifie-la caractère par caractère.
     // Jamais une adresse liée à un autre projet ; garde bien sa clé : sans elle,
     // la part est perdue.
     beneficiary: "",
@@ -81,7 +84,8 @@ export const launchConfig = {
     // Début du mint et de la première période de 30 jours, date ISO en UTC
     // (ex. "2026-12-01T20:00:00Z"). Obligatoire sur le mainnet.
     mintStart: "",
-    // Wallet des fondateurs (30 % des mints). Vide = le wallet de déploiement.
+    // Wallet fondateur (Ledger), le même que vesting.beneficiary : reçoit 30 % des mints.
+    // Obligatoire sur le mainnet, différent du wallet de déploiement.
     founders: "",
     // 2 à 5 fondations candidates au départ : { name: "…", address: "0x…", url: "https://…" }
     // (adresse avec sa casse d'origine, url facultative). Les détenteurs de cartes pourront

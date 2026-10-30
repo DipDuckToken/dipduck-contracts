@@ -44,13 +44,21 @@ import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 ///      existaient au moment de la proposition, approbation à 2/3 des voix avec un
 ///      quorum, 3 approbations au plus par période. Une fondation approuvée qui ne
 ///      gagne aucune période pendant 6 périodes de suite sort de la liste.
-///      Le wallet COMMUNITY (qui détient la réserve) ne vote pas et ne propose pas.
+///      Le wallet COMMUNITY ne vote pas et ne propose pas.
+///
+///      Édition « Trophée » : les RESERVED cartes de la réserve sont des prix de concours,
+///      frappées gratuitement par COMMUNITY (`mintTrophy`), une par appel, pour un wallet qui
+///      n'en a jamais reçu et qui détient 2 cartes ou moins. Tirage à part (voir `_pick`) :
+///      rareté au moins « épique » sur le site, sans rien changer aux cartes achetées.
+///      Une carte Trophée ne vote jamais (ni période, ni propositions).
 contract DipDuckCards is ERC721 {
     using Strings for uint256;
 
     uint256 public constant MAX_SUPPLY = 3333;
-    /// @notice Cartes gratuites pour les gagnants des concours, comptées dans MAX_SUPPLY.
+    /// @notice Cartes Trophée gratuites pour les gagnants des concours, comptées dans MAX_SUPPLY.
     uint256 public constant RESERVED = 111;
+    /// @dev Un wallet qui détient plus de cartes ne peut pas recevoir de Trophée.
+    uint256 private constant TROPHY_MAX_BALANCE = 2;
     uint256 public constant PRICE = 0.001 ether;
     uint256 internal constant MAX_PER_WALLET = 10;
     /// @notice Délai entre le mint et la révélation, en blocs (`block.number`).
@@ -118,11 +126,12 @@ contract DipDuckCards is ERC721 {
     struct Card {
         bytes32 name;
         address minter;
-        uint56 commitBlock;
+        uint48 commitBlock;
         uint16 lucky;
         uint8 mood;
         uint8 element;
         uint8 status;
+        bool trophy;
     }
 
     /// @dev Une fondation : votable à partir de la période `fromRound`, tant qu'elle est active.
@@ -168,6 +177,8 @@ contract DipDuckCards is ERC721 {
     mapping(uint256 tokenId => Card) private _cards;
     mapping(uint256 tokenId => bytes32) private _seeds;
     mapping(address minter => uint256) public mintedBy;
+    /// @notice Le wallet a déjà reçu une carte Trophée (une seule à vie).
+    mapping(address wallet => bool) public trophyReceived;
 
     uint256 public totalMinted;
     uint256 public reservedMinted;
@@ -244,6 +255,7 @@ contract DipDuckCards is ERC721 {
     error ProposalClosed();
     error VotingNotOver(uint256 endsAt);
     error NothingToSend();
+    error TrophyNotAllowed();
 
     constructor(
         address founders,
@@ -297,23 +309,30 @@ contract DipDuckCards is ERC721 {
         roundCommunity[round] += msg.value - founders - charity;
 
         _autoReveal();
-        _mintCards(msg.sender, quantity, name, mood, element, lucky);
+        _mintCards(msg.sender, quantity, name, mood, element, lucky, false);
     }
 
-    /// @notice Cartes gratuites de la réserve (concours), seulement depuis le wallet communauté.
-    function mintReserved(address to, uint256 quantity, bytes32 name, uint8 mood, uint8 element, uint16 lucky)
-        external
-    {
+    /// @notice Une carte Trophée gratuite de la réserve (prix de concours), seulement depuis le
+    ///         wallet communauté. `to` : n'a jamais reçu de Trophée, détient 2 cartes ou moins,
+    ///         n'est pas COMMUNITY.
+    function mintTrophy(address to, bytes32 name, uint8 mood, uint8 element, uint16 lucky) external {
         if (msg.sender != COMMUNITY) revert OnlyCommunity();
-        if (quantity == 0) revert InvalidQuantity();
-        if (reservedMinted + quantity > RESERVED) revert SoldOut();
-        reservedMinted += quantity;
-        _mintCards(to, quantity, name, mood, element, lucky);
+        if (reservedMinted == RESERVED) revert SoldOut();
+        if (to == COMMUNITY || trophyReceived[to] || balanceOf(to) > TROPHY_MAX_BALANCE) revert TrophyNotAllowed();
+        trophyReceived[to] = true;
+        reservedMinted++;
+        _mintCards(to, 1, name, mood, element, lucky, true);
     }
 
-    function _mintCards(address to, uint256 quantity, bytes32 name, uint8 mood, uint8 element, uint16 lucky)
-        private
-    {
+    function _mintCards(
+        address to,
+        uint256 quantity,
+        bytes32 name,
+        uint8 mood,
+        uint8 element,
+        uint16 lucky,
+        bool trophy
+    ) private {
         if (mood > 3 || element > 3 || lucky > 999) revert InvalidChoice();
         _checkName(name);
         uint256 first = totalMinted + 1;
@@ -322,11 +341,12 @@ contract DipDuckCards is ERC721 {
             _cards[id] = Card({
                 name: name,
                 minter: to,
-                commitBlock: uint56(block.number),
+                commitBlock: uint48(block.number),
                 lucky: lucky,
                 mood: mood,
                 element: element,
-                status: PENDING
+                status: PENDING,
+                trophy: trophy
             });
             _mint(to, id); // pas de rappel vers le destinataire : aucune réentrance possible pendant le mint
         }
@@ -407,40 +427,49 @@ contract DipDuckCards is ERC721 {
 
     /// @notice Les 10 attributs (index dans les tables ci-dessus) et si la carte est révélée.
     ///         Pas encore révélée : des zéros et `false`. Une carte « Plain » (révélation
-    ///         trop tardive) renvoie aussi des zéros, avec `true`.
+    ///         trop tardive) renvoie l'option la plus commune permise, avec `true` : des zéros,
+    ///         ou le plancher du tirage pour une carte Trophée.
     function traitsOf(uint256 tokenId) public view returns (uint8[10] memory traits, bool revealed) {
         _requireOwned(tokenId);
         Card memory card = _cards[tokenId];
         revealed = card.status != PENDING;
-        if (card.status != REVEALED) return (traits, revealed);
-        bytes32 seed = _seeds[tokenId];
+        if (!revealed) return (traits, revealed);
+        bytes32 seed = _seeds[tokenId]; // nulle pour une carte Plain (voir `_pick`)
         for (uint256 t = 0; t < TRAIT_COUNT; t++) {
             traits[t] = _pick(card, seed, t);
         }
     }
 
+    /// @notice Choix du joueur, bloc d'engagement, révélée ou non, et édition Trophée.
     function cardOf(uint256 tokenId)
         external
         view
-        returns (bytes32 name, uint8 mood, uint8 element, uint16 lucky, uint64 commitBlock, bool revealed)
+        returns (bytes32 name, uint8 mood, uint8 element, uint16 lucky, uint64 commitBlock, bool revealed, bool trophy)
     {
         _requireOwned(tokenId);
-        Card memory card = _cards[tokenId];
-        return (card.name, card.mood, card.element, card.lucky, uint64(card.commitBlock), card.status != PENDING);
+        Card storage card = _cards[tokenId];
+        return (
+            card.name, card.mood, card.element, card.lucky, uint64(card.commitBlock), card.status != PENDING, card.trophy
+        );
     }
 
+    /// @dev Tirage d'un attribut. Carte Trophée : tirage à part, sans l'option la plus commune
+    ///      (sans les deux plus communes pour le cadre et les joues) : son score de rareté sur
+    ///      le site vaut au moins celui du top 3,6 % (« épique »). Les cartes achetées gardent
+    ///      exactement leurs tirages. Graine nulle (carte Plain) : l'option la plus commune permise.
     function _pick(Card memory card, bytes32 seed, uint256 t) internal pure returns (uint8) {
         uint256 start = uint8(OFFSETS[t]);
         uint256 count = uint8(OFFSETS[t + 1]) - start;
+        uint256 floor = card.trophy ? (t == 6 || t == 7 ? 2 : 1) : 0;
         uint256[8] memory weights;
         uint256 sum;
-        for (uint256 i = 0; i < count; i++) {
+        for (uint256 i = floor; i < count; i++) {
             uint256 base = (uint256(uint8(WEIGHTS[(start + i) * 2])) << 8) | uint8(WEIGHTS[(start + i) * 2 + 1]);
             weights[i] = base * _boost(card, t, i);
             sum += weights[i];
         }
-        uint256 roll = (uint256(uint32(uint256(keccak256(abi.encode(seed, t))))) * sum) >> 32;
-        for (uint256 i = 0; i < count; i++) {
+        uint256 roll = seed == 0 ? 0 : (uint256(uint32(uint256(keccak256(abi.encode(seed, t))))) * sum) >> 32;
+        for (uint256 i = floor; i < count; i++) {
             if (roll < weights[i]) return uint8(i);
             roll -= weights[i];
         }
@@ -448,26 +477,27 @@ contract DipDuckCards is ERC721 {
     }
 
     /// @dev Les « secrets » : multiplicateur (en %) d'une option selon les choix du joueur.
+    ///      Une seule règle au plus par option : chaque règle donne directement le multiplicateur.
     function _boost(Card memory card, uint256 t, uint256 i) internal pure returns (uint256 m) {
         m = 100;
         uint8 e = card.element; // 0 eau, 1 feu, 2 glace, 3 foudre
         uint8 mood = card.mood; // 0 calme, 1 courageux, 2 endormi, 3 affamé
-        if (t == 0 && i == 3 && mood == 2) m = (m * 200) / 100; // bg.night
-        if (t == 1 && i == 2 && e == 2) m = (m * 200) / 100; // duck.ice
-        if (t == 1 && i == 5 && _isSatoshi(card.name)) m = (m * 300) / 100; // duck.golden
-        if (t == 2 && i == 3 && mood == 1) m = (m * 150) / 100; // hat.crown
-        if (t == 2 && i == 4 && mood == 0) m = (m * 200) / 100; // hat.halo
-        if (t == 3 && i == 1 && e == 1) m = (m * 200) / 100; // eyes.laser
-        if (t == 5 && i == 1 && e == 0) m = (m * 200) / 100; // aura.bubbles
-        if (t == 5 && i == 2 && mood == 3) m = (m * 200) / 100; // aura.coins
-        if (t == 5 && i == 5 && e == 3) m = (m * 300) / 100; // aura.lightning
-        if (t == 6 && (i == 2 || i == 3) && _hasSeven(card.lucky)) m = (m * 150) / 100; // frame.gold / holo
-        if (t == 7 && i == 1 && mood == 0) m = (m * 150) / 100; // cheeks.blush
-        if (t == 7 && i == 3 && mood == 1) m = (m * 200) / 100; // cheeks.warpaint
-        if (t == 8 && i == 5 && card.lucky == 777) m = (m * 300) / 100; // item.moon
-        if (t == 8 && i == 6 && mood == 3) m = (m * 200) / 100; // item.egg
-        if (t == 9 && i == 2 && e == 2) m = (m * 200) / 100; // weather.snow
-        if (t == 9 && i == 4 && e == 3) m = (m * 200) / 100; // weather.meteor
+        if (t == 0 && i == 3 && mood == 2) m = 200; // bg.night
+        if (t == 1 && i == 2 && e == 2) m = 200; // duck.ice
+        if (t == 1 && i == 5 && _isSatoshi(card.name)) m = 300; // duck.golden
+        if (t == 2 && i == 3 && mood == 1) m = 150; // hat.crown
+        if (t == 2 && i == 4 && mood == 0) m = 200; // hat.halo
+        if (t == 3 && i == 1 && e == 1) m = 200; // eyes.laser
+        if (t == 5 && i == 1 && e == 0) m = 200; // aura.bubbles
+        if (t == 5 && i == 2 && mood == 3) m = 200; // aura.coins
+        if (t == 5 && i == 5 && e == 3) m = 300; // aura.lightning
+        if (t == 6 && (i == 2 || i == 3) && _hasSeven(card.lucky)) m = 150; // frame.gold / holo
+        if (t == 7 && i == 1 && mood == 0) m = 150; // cheeks.blush
+        if (t == 7 && i == 3 && mood == 1) m = 200; // cheeks.warpaint
+        if (t == 8 && i == 5 && card.lucky == 777) m = 300; // item.moon
+        if (t == 8 && i == 6 && mood == 3) m = 200; // item.egg
+        if (t == 9 && i == 2 && e == 2) m = 200; // weather.snow
+        if (t == 9 && i == 4 && e == 3) m = 200; // weather.meteor
     }
 
     function _hasSeven(uint16 lucky) private pure returns (bool) {
@@ -638,7 +668,7 @@ contract DipDuckCards is ERC721 {
     // --- Vote de la fondation ----------------------------------------------------
 
     /// @notice Pendant la période en cours : une voix par carte et par période pour une fondation
-    ///         active. Le wallet COMMUNITY (réserve) ne vote pas.
+    ///         active. Le wallet COMMUNITY et les cartes Trophée ne votent pas.
     function vote(uint256[] calldata tokenIds, uint256 candidateIndex) external {
         if (msg.sender == COMMUNITY) revert CommunityCannotVote();
         _sync();
@@ -652,6 +682,7 @@ contract DipDuckCards is ERC721 {
         for (uint256 i = 0; i < tokenIds.length; i++) {
             uint256 id = tokenIds[i];
             if (ownerOf(id) != msg.sender) revert NotCardOwner(id);
+            if (_cards[id].trophy) revert NotEligible(id);
             if (hasVoted[round][id]) revert AlreadyVoted(id);
             hasVoted[round][id] = true;
         }
@@ -747,7 +778,7 @@ contract DipDuckCards is ERC721 {
     }
 
     /// @notice Pour ou contre, pendant les 7 jours de la proposition : une voix par carte, seulement
-    ///         les cartes 1 … snapshot (déjà mintées à la proposition). COMMUNITY ne vote pas.
+    ///         les cartes 1 … snapshot (déjà mintées à la proposition), hors Trophées. COMMUNITY ne vote pas.
     function voteProposal(uint256 id, uint256[] calldata tokenIds, bool support) external {
         if (msg.sender == COMMUNITY) revert CommunityCannotVote();
         Proposal storage p = _proposals[id];
@@ -755,7 +786,7 @@ contract DipDuckCards is ERC721 {
         if (tokenIds.length == 0) revert InvalidQuantity();
         for (uint256 i = 0; i < tokenIds.length; i++) {
             uint256 tokenId = tokenIds[i];
-            if (tokenId > p.snapshot) revert NotEligible(tokenId);
+            if (tokenId > p.snapshot || _cards[tokenId].trophy) revert NotEligible(tokenId);
             if (ownerOf(tokenId) != msg.sender) revert NotCardOwner(tokenId);
             if (hasVotedProposal[id][tokenId]) revert AlreadyVoted(tokenId);
             hasVotedProposal[id][tokenId] = true;
@@ -843,7 +874,7 @@ contract DipDuckCards is ERC721 {
     /// @notice Métadonnées JSON en base64, entièrement sur la chaîne (hors image).
     function tokenURI(uint256 tokenId) public view override returns (string memory) {
         (uint8[10] memory traits, bool revealed) = traitsOf(tokenId);
-        Card memory card = _cards[tokenId];
+        Card storage card = _cards[tokenId];
         string memory id = tokenId.toString();
         bytes memory attributes;
         for (uint256 t = 0; t < TRAIT_COUNT; t++) {
@@ -859,7 +890,8 @@ contract DipDuckCards is ERC721 {
             ",",
             _attribute("name", _nameString(card.name)),
             ",",
-            _attribute("revealed", revealed ? "yes" : "no")
+            _attribute("revealed", revealed ? "yes" : "no"),
+            card.trophy ? ',{"trait_type":"edition","value":"trophy"}' : ""
         );
         bytes memory json = abi.encodePacked(
             '{"name":"Dip Duck #',

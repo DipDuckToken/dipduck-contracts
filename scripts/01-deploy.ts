@@ -35,7 +35,11 @@ async function deploy(connection: NetworkConnection, profile: NetworkProfile): P
   assertSameAccount(wallet, signer.address);
   const { chainId } = await ethers.provider.getNetwork();
 
-  const params: TokenParams = launchConfig.token;
+  // Le token crée sa paire Uniswap v2 au déploiement : la limite anti-bot s'y attache.
+  const params: TokenParams = { ...launchConfig.token, factory: profile.uniswapV2?.factory, weth: profile.uniswapV2?.weth };
+  if (profile.isMainnet && profile.uniswapV2 === undefined) {
+    throw new LaunchError("Adresses Uniswap v2 manquantes : impossible d'activer l'anti-bot. Rien n'a été envoyé.");
+  }
   const symbol = existing?.token?.symbol ?? params.symbol;
 
   if (existing?.token === undefined) {
@@ -53,6 +57,12 @@ async function deploy(connection: NetworkConnection, profile: NetworkProfile): P
     row("Nom", params.name);
     row("Symbole", params.symbol);
     row("Offre totale", `${formatTokenAmount(params.supply * UNIT)} ${params.symbol}`);
+    row(
+      "Anti-bot",
+      params.factory === undefined
+        ? "aucun (pas d'Uniswap v2 sur ce réseau)"
+        : "max 0,5 % par wallet la 1re heure, 1 % jusqu'à 6 h, 2 % jusqu'à 24 h, puis aucune limite",
+    );
     row("Gas estimé", estimate.gas.toString());
     row("Coût maximal estimé", formatEth(estimate.maxCostWei));
 

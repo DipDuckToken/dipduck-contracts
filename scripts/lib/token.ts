@@ -1,5 +1,5 @@
 import type { HardhatEthers } from "@nomicfoundation/hardhat-ethers/types";
-import type { Signer } from "ethers";
+import { type Signer, ZeroAddress } from "ethers";
 
 import type { GameRecord, NftRecord, TokenRecord, VestingRecord } from "./records.ts";
 import { GAS_MARGIN_PERCENT } from "./tx.ts";
@@ -60,12 +60,19 @@ export function vestingConstructorArgs(
   return [vesting.beneficiary, BigInt(vesting.start), BigInt(vesting.durationSeconds), BigInt(vesting.cliffSeconds)];
 }
 
-export function constructorArgs(params: TokenParams): [string, string, bigint] {
-  return [params.name, params.symbol, params.supply];
+/** Arguments du constructeur de MemeToken, dans l'ordre : nom, symbole, offre, factory, WETH. */
+export function constructorArgs(params: TokenParams): [string, string, bigint, string, string] {
+  return [params.name, params.symbol, params.supply, params.factory ?? ZeroAddress, params.weth ?? ZeroAddress];
 }
 
 export function paramsOf(record: TokenRecord): TokenParams {
-  return { name: record.name, symbol: record.symbol, supply: BigInt(record.supplyWholeTokens) };
+  return {
+    name: record.name,
+    symbol: record.symbol,
+    supply: BigInt(record.supplyWholeTokens),
+    factory: record.factory,
+    weth: record.weth,
+  };
 }
 
 export interface DeploymentEstimate {

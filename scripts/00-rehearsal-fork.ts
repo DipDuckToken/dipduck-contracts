@@ -77,6 +77,11 @@ await runScript(async () => {
     "Revente test",
     `→ ${formatEth(roundTrip.ethBack)} (écart ${percent(roundTripLoss, roundTrip.ethIn)} : frais 2 × 0,3 % + impact de prix)`,
   );
+  row(
+    "Anti-bot",
+    `max ${formatTokenAmount(report.antiBot.limitAtLaunch)} ${params.symbol} par wallet à l'ouverture : ` +
+      "gros achat refusé ✔, accepté après 24 h ✔",
+  );
   row("Gas token/seeder/pool", `${gasUsed.token} / ${gasUsed.seeder} / ${gasUsed.seed}`);
   if (report.vesting !== undefined) {
     const { locked, cliff, end, releasedAtCliff, releasedAtEnd } = report.vesting;

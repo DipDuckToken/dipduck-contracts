@@ -403,14 +403,16 @@ bytecode déployé correspond toujours à celui que Blockscout recompile.
   libération linéaire, tout à la fin), versement toujours au bénéficiaire quel que soit
   l'appelant, `renounceOwnership` désactivée ; fuzzing du montant libéré (jamais en
   baisse, jamais plus que la part).
-- `contracts/DipDuckCards.t.sol` : mint (prix exact, limites, début, réserve), commit-reveal
+- `contracts/DipDuckCards.t.sol` : mint (prix exact, limites, début), édition Trophée (communauté
+  seulement, 111 au plus, une par wallet à vie, 2 cartes ou moins, tirage à part, Plain au
+  plancher, jamais de vote), commit-reveal
   (avant le bloc cible, après, expiration → Plain, `revealMany`, révélation au passage),
   attributs déterministes, secrets, noms (fuzzing) ; périodes de 30 jours, cagnottes et
   répartition exacte, rien avant la fin d'une période, vote par période, gagnant et report,
   clôture et versements en mode pull (un destinataire qui refuse l'ETH ne bloque personne),
   propositions : dépôt rendu ou confisqué, snapshot (un mint de dernière minute ne vote pas),
   fenêtre de 7 jours, 2/3, quorum, 3 approbations par période, expiration après 6 périodes,
-  cartes de réserve du wallet communauté sans vote, limite de 20.
+  wallet communauté sans vote, limite de 20.
 - `contracts/DipDuckGame.t.sol` : genèse (validation, lecture), enregistrement des
   clôtures officielles (jours terminés seulement, mauvais round refusé, réponse invalide,
   changement de phase, panne du flux de 5 jours puis rattrapage, `startRun` pendant la panne,
@@ -473,13 +475,13 @@ promesse**, et rien ne va dans le pool du token. À déployer 2 à 4 semaines ap
 
 | Ce qui est fixé dans le contrat | Valeur |
 | --- | --- |
-| Offre | 3 333 cartes, dont 111 de réserve (gratuites, frappées par le wallet communauté pour les concours) |
+| Offre | 3 333 cartes, dont 111 de réserve : l'édition Trophée (gratuites, frappées par le wallet communauté pour les concours) |
 | Prix | 0,001 ETH par carte, prix exact ; 10 cartes au maximum par wallet |
 | Répartition de chaque mint | 30 % fondateurs, 30 % fondation, le reste (40 %) communauté, dans les cagnottes de la **période de 30 jours** en cours |
 | Versements (mode pull) | **rien avant la fin d'une période** ; ensuite n'importe qui la clôture (`closeRounds(max)`, dans l'ordre) : les parts sont **créditées** en soldes dus (`owed(adresse)`) aux adresses fixées au déploiement et à la fondation gagnante. Puis n'importe qui déclenche `withdraw(destinataire)`, qui n'envoie qu'à ce destinataire son dû. S'il refuse l'ETH, la transaction réussit, son solde reste crédité (`WithdrawFailed`) et personne d'autre n'est bloqué. Événements : `RoundClosed`, `Credited`, `CharityReleased`, `Withdrawn`… (traçables sur Blockscout) |
 | Vote de la fondation | à chaque période, 1 carte = 1 voix (une carte revote à chaque période) ; la cagnotte fondation de la période va au gagnant ; égalité → le plus petit index ; sans aucune voix, elle est reportée sur la période en cours |
 | Nouvelles fondations | un détenteur propose (`propose`) avec un **dépôt de 0,005 ETH**, un nom (40 octets), la description (280) et le lien `https://` (200 octets) de la **page officielle de dons qui affiche l'adresse** ; **snapshot** : seules les cartes n° 1 à `totalMinted` au moment de la proposition votent, oui ou non, une fois chacune, pendant **7 jours pleins** (indépendants des périodes) ; ensuite n'importe qui finalise : approuvée si oui ≥ 2/3 des voix exprimées **et** oui + non ≥ quorum = max(25, 5 % des cartes du snapshot, arrondi au-dessus). Approuvée : candidate dès la période suivante, dépôt rendu (crédité). Refusée : dépôt versé à la cagnotte communauté de la période en cours. **3 approbations au plus par période** et 20 fondations actives au plus : au-delà, la proposition finit « sans place » (`FULL`), dépôt rendu, et elle peut être reproposée. Une fondation approuvée qui ne gagne **aucune période pendant 6 périodes de suite** expire et libère sa place (les fondations de départ n'expirent pas). Une seule proposition ouverte par wallet de fondation ; le dépôt remplace l'ancienne limite d'une proposition par adresse et par période |
-| Cartes de réserve | tant qu'elles sont détenues par le wallet communauté, elles **ne votent pas** (ni période, ni propositions) et ce wallet ne propose pas ; données à un gagnant, elles votent normalement. Limite : le wallet communauté pourrait les transférer à une autre de ses adresses — cela se verrait sur Blockscout |
+| Édition Trophée (réserve) | les 111 cartes de réserve sont des prix de concours gratuits, frappés par le wallet communauté (`mintTrophy(to, nom, humeur, élément, nombre)`, une par appel) : **une seule par wallet à vie** (`trophyReceived`), seulement pour un wallet qui détient **2 cartes ou moins** au moment du mint, jamais pour le wallet communauté. Tirage à part : sans l'option la plus commune de chaque attribut (sans les deux plus communes pour le cadre et les joues), donc au moins « épique » sur le site (top 3,6 % au pire), sans rien changer aux tirages des cartes achetées. `cardOf` renvoie `trophy`, et le JSON porte l'attribut `edition: trophy`. **Une carte Trophée ne vote jamais** (ni période, ni propositions, même transférée) ; le wallet communauté ne vote pas et ne propose pas |
 | Métadonnées | JSON entièrement sur la chaîne (`tokenURI`), image `<imageBaseURI><numéro>.png`, page `<viewerURI>?id=<numéro>` |
 
 Pas d'owner, rien de modifiable après le déploiement. Le vote, une proposition et une
