@@ -2,22 +2,28 @@ import type { Provider } from "ethers";
 
 import { LaunchError } from "./errors.ts";
 
-export interface UniswapV2Deployment {
+export interface UniswapV3Deployment {
   factory: string;
-  router: string;
+  /** NonfungiblePositionManager : il crée la position du lancement. */
+  positionManager: string;
+  /** Routeur d'échange (SwapRouter02 sur le mainnet) : achats et reventes de la répétition. */
+  swapRouter: string;
+  /** QuoterV2 : montant exact d'un échange avant de l'envoyer. */
+  quoter: string;
   weth: string;
 }
 
 /**
- * Uniswap v2 sur Robinhood Chain (chain ID 4663).
- * Source : @uniswap/sdk-core 7.19.4 (V2_FACTORY_ADDRESSES, V2_ROUTER_ADDRESSES,
- * WETH9) ; l'adresse WETH correspond aussi à « L2 Weth » dans la doc Robinhood
- * Chain. Les scripts revérifient sur la chaîne que router.factory() et
- * router.WETH() renvoient bien ces adresses avant toute transaction.
+ * Uniswap v3 sur Robinhood Chain (chain ID 4663), adresses officielles. Les scripts
+ * revérifient sur la chaîne, avant toute transaction, que le gestionnaire de
+ * positions, le routeur et le quoter annoncent bien cette factory et ce WETH, et
+ * que le niveau de frais 1 % a un espacement de 200 ticks.
  */
-export const ROBINHOOD_UNISWAP_V2: UniswapV2Deployment = {
-  factory: "0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f",
-  router: "0x89e5DB8B5aA49aA85AC63f691524311AEB649eba",
+export const ROBINHOOD_UNISWAP_V3: UniswapV3Deployment = {
+  factory: "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA",
+  positionManager: "0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3",
+  swapRouter: "0xCaf681a66D020601342297493863E78C959E5cb2",
+  quoter: "0x33e885eD0Ec9bF04EcfB19341582aADCb4c8A9E7",
   weth: "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
 };
 
@@ -29,8 +35,8 @@ export interface NetworkProfile {
   isMainnet: boolean;
   isFork: boolean;
   explorerUrl?: string;
-  /** Absent quand Uniswap v2 n'est pas référencé sur le réseau (testnet). */
-  uniswapV2?: UniswapV2Deployment;
+  /** Absent quand Uniswap v3 n'est pas référencé sur le réseau (testnet). */
+  uniswapV3?: UniswapV3Deployment;
 }
 
 export const NETWORK_PROFILES: Readonly<Record<string, NetworkProfile>> = {
@@ -41,7 +47,7 @@ export const NETWORK_PROFILES: Readonly<Record<string, NetworkProfile>> = {
     isMainnet: true,
     isFork: false,
     explorerUrl: "https://robinhoodchain.blockscout.com",
-    uniswapV2: ROBINHOOD_UNISWAP_V2,
+    uniswapV3: ROBINHOOD_UNISWAP_V3,
   },
   robinhoodTestnet: {
     name: "robinhoodTestnet",
@@ -56,7 +62,7 @@ export const NETWORK_PROFILES: Readonly<Record<string, NetworkProfile>> = {
     label: "Fork local du mainnet (simulation, rien n'est envoyé)",
     isMainnet: false,
     isFork: true,
-    uniswapV2: ROBINHOOD_UNISWAP_V2,
+    uniswapV3: ROBINHOOD_UNISWAP_V3,
   },
 };
 

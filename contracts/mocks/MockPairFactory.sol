@@ -2,20 +2,20 @@
 pragma solidity 0.8.34;
 
 /// @title MockPairFactory
-/// @notice Factory Uniswap v2 d'essai (tests uniquement) : `createPair` enregistre
-///         une adresse de paire fictive, sans déployer de contrat.
+/// @notice Factory Uniswap v3 d'essai (tests uniquement) : `createPool` enregistre
+///         une adresse de pool fictive, sans déployer de contrat.
 contract MockPairFactory {
-    mapping(address => mapping(address => address)) public getPair;
+    mapping(address => mapping(address => mapping(uint24 => address))) public getPool;
 
-    function createPair(address tokenA, address tokenB) external returns (address pair) {
-        pair = address(uint160(uint256(keccak256(abi.encode(tokenA, tokenB)))));
-        getPair[tokenA][tokenB] = pair;
-        getPair[tokenB][tokenA] = pair;
+    function createPool(address tokenA, address tokenB, uint24 fee) external returns (address pool) {
+        pool = address(uint160(uint256(keccak256(abi.encode(tokenA, tokenB, fee)))));
+        getPool[tokenA][tokenB][fee] = pool;
+        getPool[tokenB][tokenA][fee] = pool;
     }
 
-    /// @notice Simule une paire créée d'avance par un tiers.
-    function setPair(address tokenA, address tokenB, address pair) external {
-        getPair[tokenA][tokenB] = pair;
-        getPair[tokenB][tokenA] = pair;
+    /// @notice Simule un pool créé d'avance par un tiers.
+    function setPool(address tokenA, address tokenB, uint24 fee, address pool) external {
+        getPool[tokenA][tokenB][fee] = pool;
+        getPool[tokenB][tokenA][fee] = pool;
     }
 }

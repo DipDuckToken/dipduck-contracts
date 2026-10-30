@@ -55,7 +55,7 @@ export default defineConfig({
   // hardforkHistory : indispensable à la copie locale (fork). Le simulateur
   // ne connaît pas l'historique de cette chaîne et refuse sinon d'exécuter
   // quoi que ce soit sur l'état copié. Les règles Cancun suffisent aux
-  // contrats du kit (compilés pour Cancun) et à Uniswap v2.
+  // contrats du kit (compilés pour Cancun) et à Uniswap v3.
   chainDescriptors: {
     4663: {
       name: "Robinhood Chain",

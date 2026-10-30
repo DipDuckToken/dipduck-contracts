@@ -10,12 +10,12 @@ import { Contract, MaxUint256 } from "ethers";
 import hre from "hardhat";
 
 import { UNIT } from "./lib/constants.ts";
-import { formatDelay, formatOpenAt, readCurveStatus } from "./lib/curve.ts";
 import { LaunchError, runScript } from "./lib/errors.ts";
 import { formatDate, formatEth, formatRatio, formatTokenAmount, heading, percent, row } from "./lib/format.ts";
+import { formatDelay, formatOpenAt, readLaunchStatus, tokenBalance } from "./lib/launch.ts";
 import { explorerLink, resolveNetworkProfile } from "./lib/networks.ts";
 import { fileJournal } from "./lib/records.ts";
-import { ERC20_ABI, readPoolStatus } from "./lib/uniswap.ts";
+import { ERC20_ABI } from "./lib/uniswap.ts";
 import { readVestingStatus } from "./lib/vesting.ts";
 
 await runScript(async () => {
@@ -36,22 +36,22 @@ await runScript(async () => {
     throw new LaunchError(`Aucun token dans le journal (${journal.location}).`);
   }
   if (record.token.status !== "confirmed") {
-    console.log(`\n  Déploiement de la courbe noté (nonce ${record.token.nonce}) mais pas encore confirmé.`);
+    console.log(`\n  Déploiement du lanceur noté (nonce ${record.token.nonce}) mais pas encore confirmé.`);
     console.log(`  Relance npm run deploy:${step} pour reprendre son suivi.`);
     return;
   }
 
   const token = new Contract(record.token.address, ERC20_ABI, ethers.provider);
-  const [name, symbol, totalSupply, deployerBalance, curve, latest] = await Promise.all([
+  const [name, symbol, totalSupply, deployerBalance, launch, latest] = await Promise.all([
     token.name() as Promise<string>,
     token.symbol() as Promise<string>,
     token.totalSupply() as Promise<bigint>,
     token.balanceOf(record.token.from) as Promise<bigint>,
-    readCurveStatus(ethers.provider, record.token.curve),
+    readLaunchStatus(ethers.provider, record.token.launcher),
     ethers.provider.getBlock("latest"),
   ]);
   const now = BigInt(latest?.timestamp ?? Math.floor(Date.now() / 1000));
-  const curveBalance = (await token.balanceOf(curve.curve)) as bigint;
+  const { state } = launch;
 
   heading(`${name} (${symbol}) — ${profile.label}`);
   row("Token", record.token.address);
@@ -59,44 +59,41 @@ await runScript(async () => {
   row("Détenu par le déployeur", deployerBalance === 0n ? "rien ✔" : `${formatTokenAmount(deployerBalance)} ${symbol} ⚠`);
   row("Explorateur", explorerLink(profile, "token", record.token.address) ?? "—");
 
-  heading("Courbe de lancement");
-  row("Adresse (pour acheter)", curve.curve);
-  const open = now >= curve.openAt;
-  row("Ouverture des achats", `${formatOpenAt(curve.openAt)} — ${open ? "ouverte ✔" : `pas encore (${formatDelay(curve.openAt, now)})`}`);
-  row("ETH réuni", `${formatEth(curve.ethReserve)} / ${formatEth(curve.targetEth)} (${percent(curve.ethReserve, curve.targetEth)})`);
+  heading("Pool Uniswap v3 (TOKEN/WETH, 1 %)");
+  row("Pool", launch.pool);
+  const open = now >= launch.openAt;
+  row("Ouverture des échanges", `${formatOpenAt(launch.openAt)} — ${open ? "ouverts ✔" : `pas encore (${formatDelay(launch.openAt, now)})`}`);
+  row("Prix actuel", `${formatRatio(state.priceWei, UNIT)} ETH par ${symbol}`);
+  row("Capitalisation actuelle", formatEth((state.priceWei * totalSupply) / UNIT));
+  row("ETH dans le pool", `${formatEth(state.wethBalance)} (apporté par les acheteurs)`);
+  row("Tokens dans le pool", `${formatTokenAmount(state.tokenBalance)} ${symbol} (${percent(state.tokenBalance, totalSupply)} de l'offre)`);
+  row("Placés au lancement", `${formatTokenAmount(launch.poolTokens)} ${symbol}`);
   row(
-    "Tokens vendus",
-    `${formatTokenAmount(curve.tokensSold)} ${symbol} — ${percent(curve.tokensSold, curve.curveTokens)} de ce que la courbe vend, ` +
-      `${percent(curve.tokensSold, totalSupply)} de l'offre`,
+    "Limite par wallet",
+    !open
+      ? "aucun achat possible avant l'ouverture"
+      : launch.walletLimit === MaxUint256
+        ? "aucune (24 h passées)"
+        : `${formatTokenAmount(launch.walletLimit)} ${symbol} (${percent(launch.walletLimit, totalSupply)} de l'offre)`,
   );
-  if (!curve.graduated) {
-    row("Prix actuel", `${formatRatio(curve.price, UNIT)} ETH par ${symbol}`);
-    row("Capitalisation actuelle", formatEth((curve.price * totalSupply) / UNIT));
-    row(
-      "Limite par wallet",
-      !open
-        ? "achats pas encore ouverts"
-        : curve.walletLimit === MaxUint256
-          ? "aucune (24 h passées)"
-          : `${formatTokenAmount(curve.walletLimit)} ${symbol} (${percent(curve.walletLimit, totalSupply)} de l'offre)`,
-    );
-    row("Tokens dans la courbe", `${formatTokenAmount(curveBalance)} ${symbol} (ta part et la réserve comprises)`);
-  }
-  row("Explorateur", explorerLink(profile, "address", curve.curve) ?? "—");
+  row("Liquidité", `position n° ${launch.positionId}, gardée à vie par le lanceur ${launch.launcher}`);
+  row(
+    "Frais en attente",
+    launch.pendingFees === undefined
+      ? "illisibles pour l'instant (pendant les 24 h, le Safe peut dépasser la limite : réessaie après)"
+      : `${formatEth(launch.pendingFees.weth)} et ${formatTokenAmount(launch.pendingFees.tokens)} ${symbol}` +
+          (launch.pendingFees.weth > 0n || launch.pendingFees.tokens > 0n ? ` — npm run fees:${step} les verse au Safe` : ""),
+  );
+  row("Explorateur (pool)", explorerLink(profile, "address", launch.pool) ?? "—");
 
-  if (curve.vestingTokens > 0n && record.vesting?.status === "confirmed") {
+  if (launch.vestingTokens > 0n && record.vesting?.status === "confirmed") {
     const vesting = await readVestingStatus(ethers.provider, record.vesting.address, record.token.address);
     heading("Ta part (vesting)");
     row("Contrat de blocage", record.vesting.address);
     row("Bénéficiaire", vesting.beneficiary);
-    row("Prévue", `${formatTokenAmount(curve.vestingTokens)} ${symbol} (${percent(curve.vestingTokens, totalSupply)} de l'offre)`);
-    if (!curve.graduated) {
-      row("", "gardée par la courbe, versée au contrat de blocage à l'ouverture du pool");
-    } else {
-      row("Encore bloqué", `${formatTokenAmount(vesting.locked)} ${symbol}`);
-      row("Déjà versé", `${formatTokenAmount(vesting.released)} ${symbol}`);
-      row("Libérable maintenant", `${formatTokenAmount(vesting.releasable)} ${symbol}`);
-    }
+    row("Encore bloqué", `${formatTokenAmount(vesting.locked)} ${symbol} (${percent(vesting.locked, totalSupply)} de l'offre)`);
+    row("Déjà versé", `${formatTokenAmount(vesting.released)} ${symbol}`);
+    row("Libérable maintenant", `${formatTokenAmount(vesting.releasable)} ${symbol}`);
     row("Falaise", `${formatDate(vesting.cliff)}${now < vesting.cliff ? " — rien de libérable avant" : " ✔ passée"}`);
     row("Fin", formatDate(vesting.end));
     row("Explorateur", explorerLink(profile, "address", record.vesting.address) ?? "—");
@@ -110,40 +107,15 @@ await runScript(async () => {
     }
   }
 
-  if (curve.communityTokens > 0n) {
-    const held = (await token.balanceOf(curve.community)) as bigint;
-    heading("Réserve communauté");
-    row("Safe communauté", curve.community);
-    row("Prévue", `${formatTokenAmount(curve.communityTokens)} ${symbol} (${percent(curve.communityTokens, totalSupply)} de l'offre)`);
-    row("Solde actuel", curve.graduated ? `${formatTokenAmount(held)} ${symbol}` : "rien avant l'ouverture du pool (gardée par la courbe)");
-    row("Explorateur", explorerLink(profile, "address", curve.community) ?? "—");
+  heading("Safe communauté");
+  row("Adresse", launch.feeRecipient);
+  if (launch.communityTokens > 0n) {
+    row("Réserve versée au lancement", `${formatTokenAmount(launch.communityTokens)} ${symbol} (${percent(launch.communityTokens, totalSupply)})`);
   }
-
-  if (!curve.graduated) {
-    console.log(
-      `\n  Pool pas encore ouvert : il s'ouvrira tout seul quand la courbe aura réuni ${formatEth(curve.targetEth)}` +
-        ` (il manque ${formatEth(curve.targetEth - curve.ethReserve)}).`,
-    );
-    return;
-  }
-
-  heading("Pool Uniswap v2 (ouvert par la courbe)");
-  const pool = profile.uniswapV2 === undefined
-    ? undefined
-    : await readPoolStatus(ethers.provider, profile.uniswapV2, record.token.address, record.token.from);
-  if (pool === undefined) {
-    row("Paire", curve.pair);
-    console.log("\n  Uniswap v2 n'est pas référencé sur ce réseau : réserves non lues.");
-    return;
-  }
-  row("Paire", pool.pair);
-  row("Réserves", `${formatTokenAmount(pool.tokenReserve)} ${symbol} / ${formatEth(pool.wethReserve)}`);
-  row("Prix actuel", `${formatRatio(pool.wethReserve, pool.tokenReserve)} ETH par ${symbol}`);
-  row(
-    "Capitalisation actuelle",
-    pool.tokenReserve === 0n ? "—" : formatEth((pool.wethReserve * totalSupply) / pool.tokenReserve),
-  );
-  row("Part du pool verrouillée", `${percent(pool.lpBurned, pool.lpTotalSupply)} (adresse morte + adresse 0)`);
-  row("Parts LP du déployeur", pool.lpHeldBy === 0n ? "aucune ✔" : `${pool.lpHeldBy} ⚠`);
-  row("Explorateur (paire)", explorerLink(profile, "address", pool.pair) ?? "—");
+  const [safeTokens, safeWeth] = await Promise.all([
+    tokenBalance(ethers.provider, record.token.address, launch.feeRecipient),
+    tokenBalance(ethers.provider, launch.weth, launch.feeRecipient),
+  ]);
+  row("Solde actuel", `${formatTokenAmount(safeTokens)} ${symbol} et ${formatEth(safeWeth)} de WETH (frais reçus)`);
+  row("Explorateur", explorerLink(profile, "address", launch.feeRecipient) ?? "—");
 });

@@ -34,7 +34,7 @@ contract TokenVestingTest {
     function setUp() public {
         vm.warp(1_800_000_000);
         start = uint64(block.timestamp);
-        token = new MemeToken("Test Token", "TEST", 1_000_000_000, address(0), address(0));
+        token = new MemeToken("Test Token", "TEST", 1_000_000_000, address(0), address(0), 10_000, 1); // ouvert depuis toujours : transferts libres, sans limite
         vesting = new TokenVesting(BENEFICIARY, start, DURATION, CLIFF);
         token.transfer(address(vesting), LOCKED);
     }

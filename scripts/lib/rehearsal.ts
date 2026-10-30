@@ -1,53 +1,42 @@
 import type { HardhatEthers } from "@nomicfoundation/hardhat-ethers/types";
-import { Contract, Interface, MaxUint256, ZeroAddress, getAddress } from "ethers";
+import { Contract, Interface, MaxUint256, type TransactionReceipt, ZeroAddress, getAddress } from "ethers";
 import type { NetworkConnection } from "hardhat/types/network";
 
-import { DEAD_ADDRESS, TX_DEADLINE_SECONDS, UNISWAP_V2_MINIMUM_LIQUIDITY } from "./constants.ts";
-import { CURVE_ABI, type CurvePlan, buildCurvePlan, splitSupply } from "./curve.ts";
+import { LAUNCHER_ABI, type LaunchPlan, type LaunchStatus, TOKEN_LIMIT_ABI, buildLaunchPlan, readLaunchStatus, splitSupply } from "./launch.ts";
 import { LaunchError } from "./errors.ts";
-import type { UniswapV2Deployment } from "./networks.ts";
+import type { UniswapV3Deployment } from "./networks.ts";
 import { type TokenRecord, type VestingRecord, memoryJournal } from "./records.ts";
 import { assertSafe } from "./safe.ts";
 import { type StepContext, deployTokenStep, deployVestingStep } from "./steps.ts";
-import { ERC20_ABI, PAIR_ABI, type PoolStatus, ROUTER_ABI, assertUniswapV2Deployment, readPoolStatus } from "./uniswap.ts";
-import type { TokenParams, ValidatedCommunity, ValidatedCurve, ValidatedVesting } from "./validation.ts";
+import { ERC20_ABI, V3_POSITION_MANAGER_ABI, assertUniswapV3Deployment, swapperFor } from "./uniswap.ts";
+import type { TokenParams, ValidatedCommunity, ValidatedPool, ValidatedVesting } from "./validation.ts";
 import { VESTING_ABI, readVestingStatus } from "./vesting.ts";
 import { assertSameAccount, localWallet } from "./wallet.ts";
 
-const curveInterface = new Interface(CURVE_ABI);
+const launcherInterface = new Interface(LAUNCHER_ABI);
 
 export interface RehearsalReport {
   token: TokenRecord;
-  plan: CurvePlan;
-  /** Contrat de blocage déployé avant la courbe (absent sans part gardée). */
+  plan: LaunchPlan;
+  /** Contrat de blocage déployé avant le lanceur (absent sans part gardée). */
   vestingRecord?: VestingRecord;
-  /** Safe communauté utilisé ; `fakeSafe` = Safe d'essai déployé sur la copie locale. */
-  communitySafe?: { address: string; fakeSafe: boolean };
-  gasUsed: { vesting: bigint; curve: bigint; graduation: bigint };
+  /** Safe communauté (réserve et frais) ; `fakeSafe` = Safe d'essai déployé sur la copie locale. */
+  communitySafe: { address: string; fakeSafe: boolean };
+  gasUsed: { vesting: bigint; launcher: bigint };
+  /** Répartition lue sur la chaîne juste après le déploiement. */
+  distribution: { inPool: bigint; inVesting: bigint; inCommunity: bigint; deployer: bigint; positionHeldByLauncher: boolean };
   antiBot: {
     buyBeforeOpenBlocked: boolean;
     /** Limite de la 1re heure, et l'achat au-delà refusé. */
     limitAtOpen: bigint;
     bigBuyBlocked: boolean;
-    /** Après l'ouverture du pool : un gros achat sur Uniswap refusé par le token (24 h). */
-    poolBigBuyBlocked: boolean;
+    /** Après 24 h : plus de limite, un gros achat passe. */
+    bigBuyAfter24h: { ethIn: bigint; tokensOut: bigint };
   };
   smallBuys: { buyers: number; ethIn: bigint; tokensOut: bigint };
   resale: { tokensIn: bigint; ethOut: bigint };
-  graduation: {
-    ethSent: bigint;
-    ethUsed: bigint;
-    refunded: bigint;
-    pair: string;
-    ethInPool: bigint;
-    tokensInPool: bigint;
-    lpBurned: bigint;
-    tokensBurned: bigint;
-    vestingReceived: bigint;
-    communityReceived: bigint;
-  };
-  pool: PoolStatus;
-  routerBuy: { ethIn: bigint; tokensOut: bigint };
+  fees: { weth: bigint; tokens: bigint };
+  status: LaunchStatus;
   /** Présent quand une part est gardée : versée au bénéficiaire en avançant le temps. */
   vesting?: {
     locked: bigint;
@@ -64,30 +53,17 @@ async function gasUsedBy(ethers: HardhatEthers, txHash: string | undefined): Pro
   return receipt?.gasUsed ?? 0n;
 }
 
-async function deadline(ethers: HardhatEthers): Promise<bigint> {
-  const block = await ethers.provider.getBlock("latest");
-  if (block === null) throw new LaunchError("Impossible de lire le dernier bloc.");
-  return BigInt(block.timestamp) + TX_DEADLINE_SECONDS;
-}
-
-async function reverts(call: Promise<unknown>): Promise<boolean> {
-  return await call.then(
-    () => false,
-    () => true,
-  );
-}
-
 /**
  * Le lancement complet sur un réseau local (fork du mainnet ou chaîne de test),
- * avec exactement les mêmes étapes que les scripts du vrai lancement — journal
- * en mémoire, confirmations automatiques — puis la vie de la courbe : achats
- * refusés avant l'heure et au-delà de 0,5 %, petits achats, une revente, la cible
- * atteinte (pool ouvert, LP brûlées, part et réserve versées) et un achat sur Uniswap.
+ * avec exactement les mêmes étapes que le script de déploiement — journal en
+ * mémoire, confirmations automatiques — puis la vie du pool : achat refusé avant
+ * l'heure et au-delà de 0,5 %, petits achats, une revente, gros achat après 24 h,
+ * frais versés au Safe, libération de la part bloquée.
  */
 export async function runRehearsal(
   connection: NetworkConnection,
-  uniswap: UniswapV2Deployment,
-  input: { token: TokenParams; curve: ValidatedCurve; vesting?: ValidatedVesting; community?: ValidatedCommunity },
+  uniswap: UniswapV3Deployment,
+  input: { token: TokenParams; pool: ValidatedPool; vestingPercent: bigint; vesting?: ValidatedVesting; community?: ValidatedCommunity },
   log: (message: string) => void = () => {},
 ): Promise<RehearsalReport> {
   const { ethers, networkHelpers } = connection;
@@ -111,93 +87,103 @@ export async function runRehearsal(
     log,
   };
 
-  log("Contrôle des contrats Uniswap v2…");
-  await assertUniswapV2Deployment(ethers.provider, uniswap);
+  log("Contrôle des contrats Uniswap v3…");
+  await assertUniswapV3Deployment(ethers.provider, uniswap);
 
-  const communityPercent = input.community?.percent ?? 0n;
-  const split = splitSupply(input.token.supply, input.curve.tokenPercent, communityPercent);
-  const plan = buildCurvePlan({
-    supplyWholeTokens: input.token.supply,
-    split,
-    virtualEthWei: input.curve.virtualEthWei,
-    targetEthWei: input.curve.targetEthWei,
-  });
+  const split = splitSupply(input.token.supply, input.vestingPercent, input.community?.percent ?? 0n);
+  const plan = buildLaunchPlan({ supplyWholeTokens: input.token.supply, split, startTick: input.pool.startTick });
 
-  // 1. Le contrat de blocage, AVANT la courbe : elle doit connaître son adresse.
+  // 1. Le contrat de blocage, AVANT le lanceur : il lui verse la part dès son déploiement.
   let vestingRecord: VestingRecord | undefined;
   if (split.vestingWholeTokens > 0n) {
     if (input.vesting?.enabled !== true) {
-      throw new LaunchError("Ta part ne peut exister que bloquée : active le blocage, ou règle tokenPercent + réserve à 100.");
+      throw new LaunchError("Ta part ne peut exister que bloquée : active le blocage, ou mets vesting.percent à 0.");
     }
     vestingRecord = await deployVestingStep(ctx, {
       beneficiary: input.vesting.beneficiary,
-      start: input.curve.openAt,
+      start: input.pool.openAt,
       durationSeconds: input.vesting.durationSeconds,
       cliffSeconds: input.vesting.cliffSeconds,
     });
   }
 
-  // 2. Le Safe communauté, qui doit exister avant la courbe : un Safe d'essai si aucun n'est donné.
-  let communitySafe: RehearsalReport["communitySafe"];
-  if (split.communityWholeTokens > 0n) {
-    let address = input.community?.beneficiary;
-    let fakeSafe = false;
-    if (address === undefined) {
-      log("Pas de Safe communauté dans la config : déploiement d'un Safe d'essai 2 sur 3 (copie locale seulement)…");
-      const singleton = await ethers.deployContract("MockSafeSingleton", ["1.4.1"], extra(10));
-      const safe = await ethers.deployContract(
-        "MockSafe",
-        [await singleton.getAddress(), [extra(10).address, extra(11).address, extra(12).address], 2],
-        extra(10),
-      );
-      address = await safe.getAddress();
-      fakeSafe = true;
-    }
-    if ((await ethers.provider.getCode(address)) === "0x") {
-      throw new LaunchError(`Le wallet communauté ${address} n'a pas de code : la courbe exige un Safe (contrat).`);
-    }
-    await assertSafe(ethers.provider, address, deployer.address, "Le wallet communauté");
-    communitySafe = { address: getAddress(address), fakeSafe };
+  // 2. Le Safe communauté (réserve et frais) doit exister avant : un Safe d'essai si aucun n'est donné.
+  let safeAddress = input.community?.beneficiary;
+  let fakeSafe = false;
+  if (safeAddress === undefined) {
+    log("Pas de Safe communauté dans la config : déploiement d'un Safe d'essai 2 sur 3 (copie locale seulement)…");
+    const singleton = await ethers.deployContract("MockSafeSingleton", ["1.4.1"], extra(10));
+    const safe = await ethers.deployContract(
+      "MockSafe",
+      [await singleton.getAddress(), [extra(10).address, extra(11).address, extra(12).address], 2],
+      extra(10),
+    );
+    safeAddress = await safe.getAddress();
+    fakeSafe = true;
   }
+  await assertSafe(ethers.provider, safeAddress, deployer.address, "Le wallet communauté");
+  const communitySafe = { address: getAddress(safeAddress), fakeSafe };
 
-  // 3. La courbe, qui crée le token et garde 100 % de l'offre.
+  // 3. Le lanceur : token, part, réserve, pool et position d'un seul côté.
+  const positionManager = new Contract(uniswap.positionManager, V3_POSITION_MANAGER_ABI, ethers.provider);
   const token = await deployTokenStep(ctx, {
     ...input.token,
-    factory: uniswap.factory,
-    weth: uniswap.weth,
-    curveTokenPercent: input.curve.tokenPercent,
-    curveWholeTokens: split.curveWholeTokens,
-    virtualEthWei: input.curve.virtualEthWei,
-    targetEthWei: input.curve.targetEthWei,
-    openAt: input.curve.openAt,
+    positionManager: uniswap.positionManager,
+    factory: (await positionManager.factory()) as string,
+    weth: (await positionManager.WETH9()) as string,
+    startTick: input.pool.startTick,
+    openAt: input.pool.openAt,
     vesting: vestingRecord?.address ?? ZeroAddress,
     vestingWholeTokens: vestingRecord === undefined ? 0n : split.vestingWholeTokens,
-    community: communitySafe?.address ?? ZeroAddress,
+    community: split.communityWholeTokens > 0n ? communitySafe.address : ZeroAddress,
     communityWholeTokens: split.communityWholeTokens,
+    feeRecipient: communitySafe.address,
   });
   const tokenContract = new Contract(token.address, ERC20_ABI, ethers.provider);
-  const curveRead = new Contract(token.curve, CURVE_ABI, ethers.provider);
-  const curveAs = (index: number) => new Contract(token.curve, CURVE_ABI, extra(index));
   const balanceOf = async (holder: string) => (await tokenContract.balanceOf(holder)) as bigint;
-  if ((await balanceOf(deployer.address)) !== 0n || (await balanceOf(token.curve)) !== plan.totalSupply) {
-    throw new LaunchError("La courbe devrait détenir toute l'offre, et le wallet de déploiement aucun token.");
+  const launched = await readLaunchStatus(ethers.provider, token.launcher);
+  const distribution = {
+    inPool: await balanceOf(launched.pool),
+    inVesting: vestingRecord === undefined ? 0n : await balanceOf(vestingRecord.address),
+    inCommunity: await balanceOf(communitySafe.address),
+    deployer: await balanceOf(deployer.address),
+    positionHeldByLauncher:
+      getAddress((await positionManager.ownerOf(launched.positionId)) as string) === getAddress(token.launcher),
+  };
+  if (
+    distribution.deployer !== 0n ||
+    distribution.inVesting !== plan.vestingAmount ||
+    distribution.inCommunity !== plan.communityAmount ||
+    distribution.inPool !== launched.poolTokens ||
+    !distribution.positionHeldByLauncher
+  ) {
+    throw new LaunchError("Répartition inattendue après le déploiement (wallet, blocage, Safe, pool ou position).");
   }
 
   // 4. Avant l'heure : refusé.
+  const swapper = await swapperFor(ethers.provider, uniswap);
+  const canBuy = async (index: number, ethIn: bigint) =>
+    await swapper.buy(extra(index), token.address, ethIn, 0n).then(
+      async (tx) => {
+        await tx.wait();
+        return true;
+      },
+      () => false,
+    );
   log("Achat avant l'heure d'ouverture : doit être refusé…");
-  const buyBeforeOpenBlocked = await reverts(
-    curveAs(1).buy.staticCall(0n, await deadline(ethers), { value: plan.halfPercentCostWei / 4n + 1n }),
-  );
+  const snapshotBefore = await networkHelpers.takeSnapshot();
+  const buyBeforeOpenBlocked = !(await canBuy(1, plan.halfPercentCostWei / 4n + 1n));
+  await snapshotBefore.restore();
 
-  await networkHelpers.time.increaseTo(input.curve.openAt);
+  await networkHelpers.time.increaseTo(input.pool.openAt);
 
   // 5. 1re heure : au-delà de 0,5 % de l'offre, refusé.
   log("Ouverture : un achat au-delà de 0,5 % de l'offre doit être refusé…");
-  const limitAtOpen = (await curveRead.walletLimit()) as bigint;
-  const bigBuyBlocked = await reverts(
-    curveAs(1).buy.staticCall(0n, await deadline(ethers), { value: plan.halfPercentCostWei * 2n }),
-  );
-
+  const tokenLimit = new Contract(token.address, TOKEN_LIMIT_ABI, ethers.provider);
+  const limitAtOpen = (await tokenLimit.walletLimit()) as bigint;
+  const snapshotOpen = await networkHelpers.takeSnapshot();
+  const bigBuyBlocked = !(await canBuy(1, plan.halfPercentCostWei * 2n));
+  await snapshotOpen.restore();
   if (!buyBeforeOpenBlocked || !bigBuyBlocked) {
     throw new LaunchError(
       `Anti-bot inattendu : achat avant l'heure ${buyBeforeOpenBlocked ? "refusé" : "accepté"}, ` +
@@ -205,100 +191,64 @@ export async function runRehearsal(
     );
   }
 
-  // 6. Petits achats (chacun ≈ 0,1 % de l'offre), au montant exact annoncé : aucune taxe.
-  log("Petits achats sur la courbe…");
+  // 6. Petits achats (chacun ≈ 0,1 % de l'offre), au montant exact annoncé par le quoter : aucune taxe.
+  log("Petits achats via le routeur Uniswap…");
   const smallIn = plan.halfPercentCostWei / 5n > 0n ? plan.halfPercentCostWei / 5n : 1n;
   let smallTokens = 0n;
   const buyerIndexes = [1, 6, 7];
   for (const index of buyerIndexes) {
-    const [expected] = (await curveRead.quoteBuy(smallIn)) as [bigint, bigint];
+    const expected = await swapper.quoteBuy(token.address, smallIn);
     const before = await balanceOf(extra(index).address);
-    await (await curveAs(index).buy(expected, await deadline(ethers), { value: smallIn })).wait();
+    await (await swapper.buy(extra(index), token.address, smallIn, expected)).wait();
     const got = (await balanceOf(extra(index).address)) - before;
     if (got !== expected) throw new LaunchError(`L'acheteur a reçu ${got} au lieu de ${expected} : un prélèvement inattendu.`);
     smallTokens += got;
   }
 
-  // 7. Une revente à la courbe, au montant exact annoncé.
-  log("Revente d'une partie à la courbe…");
+  // 7. Une revente contre de l'ETH, au montant exact annoncé.
+  log("Revente d'une partie contre de l'ETH…");
   const tokensIn = (await balanceOf(buyer.address)) / 2n;
-  await (await new Contract(token.address, ERC20_ABI, buyer).approve(token.curve, tokensIn)).wait();
-  const expectedEth = (await curveRead.quoteSell(tokensIn)) as bigint;
+  await (await new Contract(token.address, ERC20_ABI, buyer).approve(swapper.router, tokensIn)).wait();
+  const expectedEth = await swapper.quoteSell(token.address, tokensIn);
   const ethBefore = await ethers.provider.getBalance(buyer.address);
-  const sellReceipt = await (await curveAs(1).sell(tokensIn, expectedEth, await deadline(ethers))).wait();
+  const sellReceipt = await (await swapper.sell(buyer, token.address, tokensIn, expectedEth)).wait();
   const ethOut = (await ethers.provider.getBalance(buyer.address)) - ethBefore + (sellReceipt?.fee ?? 0n);
   if (ethOut !== expectedEth) throw new LaunchError(`La revente a rendu ${ethOut} wei au lieu de ${expectedEth}.`);
 
-  // 8. 24 h plus tard : plus de limite sur la courbe ; un achat atteint la cible.
+  // 8. 24 h plus tard : plus de limite, un gros achat passe.
   await networkHelpers.time.increase(24 * 60 * 60);
-  if (((await curveRead.walletLimit()) as bigint) !== MaxUint256) {
-    throw new LaunchError("La limite par wallet de la courbe devrait être levée après 24 h.");
+  if (((await tokenLimit.walletLimit()) as bigint) !== MaxUint256) {
+    throw new LaunchError("La limite par wallet du token devrait être levée après 24 h.");
   }
-  log("Achat qui atteint la cible : le pool doit s'ouvrir tout seul…");
-  const whale = extra(8);
-  const missing = input.curve.targetEthWei - ((await curveRead.ethReserve()) as bigint);
-  const ethSent = missing + missing / 10n + 1n; // un surplus, qui doit être rendu
-  const whaleBefore = await ethers.provider.getBalance(whale.address);
-  const graduationReceipt = await (await curveAs(8).buy(0n, await deadline(ethers), { value: ethSent })).wait();
-  if (graduationReceipt === null) throw new LaunchError("Reçu introuvable pour l'achat qui atteint la cible.");
-  const spent = whaleBefore - (await ethers.provider.getBalance(whale.address)) - graduationReceipt.fee;
-  let graduated: { pair: string; eth: bigint; tokens: bigint; lp: bigint; burned: bigint } | undefined;
-  for (const entry of graduationReceipt.logs) {
-    if (getAddress(entry.address) !== getAddress(token.curve)) continue;
-    const parsed = curveInterface.parseLog({ topics: [...entry.topics], data: entry.data });
-    if (parsed?.name === "Graduated") {
-      graduated = {
-        pair: getAddress(parsed.args.pair as string),
-        eth: parsed.args.ethAmount as bigint,
-        tokens: parsed.args.tokenAmount as bigint,
-        lp: parsed.args.liquidityBurned as bigint,
-        burned: parsed.args.tokensBurned as bigint,
-      };
-    }
-  }
-  if (graduated === undefined || !((await curveRead.graduated()) as boolean)) {
-    throw new LaunchError("La cible est atteinte mais le pool ne s'est pas ouvert (aucun événement Graduated).");
-  }
-  if (graduated.eth !== input.curve.targetEthWei || spent !== missing) {
-    throw new LaunchError(`Ouverture inattendue : ${graduated.eth} wei dans le pool, ${spent} wei payés pour ${missing} manquants.`);
-  }
-  if ((await ethers.provider.getBalance(token.curve)) !== 0n) {
-    throw new LaunchError("Il reste de l'ETH dans la courbe après l'ouverture du pool.");
-  }
-  const lp = new Contract(graduated.pair, PAIR_ABI, ethers.provider);
-  const [lpTotal, lpDead] = (await Promise.all([lp.totalSupply(), lp.balanceOf(DEAD_ADDRESS)])) as [bigint, bigint];
-  if (lpDead !== graduated.lp || lpTotal !== lpDead + UNISWAP_V2_MINIMUM_LIQUIDITY) {
-    throw new LaunchError("Les parts LP ne sont pas toutes brûlées.");
-  }
-  const vestingReceived = vestingRecord === undefined ? 0n : await balanceOf(vestingRecord.address);
-  const communityReceived = communitySafe === undefined ? 0n : await balanceOf(communitySafe.address);
-  if (vestingReceived !== plan.vestingAmount || communityReceived !== plan.communityAmount) {
-    throw new LaunchError("Ta part ou la réserve n'a pas été versée au montant prévu à l'ouverture du pool.");
-  }
-  if ((await balanceOf(token.curve)) !== 0n) {
-    throw new LaunchError("Il reste des tokens dans la courbe après l'ouverture du pool.");
+  log("Après 24 h : gros achat (au-delà de 2 % de l'offre)…");
+  const bigIn = plan.halfPercentCostWei * 20n;
+  const bigExpected = await swapper.quoteBuy(token.address, bigIn);
+  const whaleBefore = await balanceOf(extra(8).address);
+  await (await swapper.buy(extra(8), token.address, bigIn, bigExpected)).wait();
+  const bigOut = (await balanceOf(extra(8).address)) - whaleBefore;
+  if (bigOut !== bigExpected || bigOut <= plan.totalSupply / 50n) {
+    throw new LaunchError(`Gros achat inattendu : ${bigOut} reçus pour ${bigExpected} annoncés.`);
   }
 
-  const pool = await readPoolStatus(ethers.provider, uniswap, token.address, deployer.address);
-  if (pool === undefined) throw new LaunchError("Le pool est introuvable après son ouverture.");
-
-  // 9. Un achat sur Uniswap, au montant exact annoncé par le routeur ; un gros achat refusé (24 h du token).
-  log("Achat via le routeur Uniswap, et gros achat refusé par l'anti-bot du token…");
-  const path = [uniswap.weth, token.address];
-  const routerBuyer = new Contract(uniswap.router, ROUTER_ABI, extra(9));
-  const tokenLimit = (await new Contract(token.address, ["function walletLimit() view returns (uint256)"], ethers.provider).walletLimit()) as bigint;
-  const bigIn = pool.wethReserve / 5n;
-  const [, bigOut] = (await routerBuyer.getAmountsOut(bigIn, path)) as [bigint, bigint];
-  const poolBigBuyBlocked =
-    bigOut > tokenLimit &&
-    (await reverts(routerBuyer.swapExactETHForTokens.staticCall(0n, path, extra(9).address, await deadline(ethers), { value: bigIn })));
-  const routerIn = pool.wethReserve / 1000n > 0n ? pool.wethReserve / 1000n : 1n;
-  const [, expectedOut] = (await routerBuyer.getAmountsOut(routerIn, path)) as [bigint, bigint];
-  await (await routerBuyer.swapExactETHForTokens(expectedOut, path, extra(9).address, await deadline(ethers), { value: routerIn })).wait();
-  const routerOut = await balanceOf(extra(9).address);
-  if (routerOut !== expectedOut) {
-    throw new LaunchError(`L'acheteur Uniswap a reçu ${routerOut} au lieu de ${expectedOut} : un prélèvement inattendu.`);
+  // 9. Les frais d'échange (1 %) vont au Safe, appelés par n'importe qui.
+  log("Versement des frais d'échange au Safe (appelé par un inconnu)…");
+  const weth = new Contract(launched.weth, ERC20_ABI, ethers.provider);
+  const safeWethBefore = (await weth.balanceOf(communitySafe.address)) as bigint;
+  const safeTokensBefore = await balanceOf(communitySafe.address);
+  const feeReceipt = (await (await new Contract(token.launcher, LAUNCHER_ABI, extra(9)).collectFees()).wait()) as TransactionReceipt | null;
+  const collected = feeReceipt?.logs
+    .filter((entry) => getAddress(entry.address) === getAddress(token.launcher))
+    .map((entry) => launcherInterface.parseLog({ topics: [...entry.topics], data: entry.data }))
+    .find((parsed) => parsed?.name === "FeesCollected");
+  const fees = {
+    weth: ((await weth.balanceOf(communitySafe.address)) as bigint) - safeWethBefore,
+    tokens: (await balanceOf(communitySafe.address)) - safeTokensBefore,
+  };
+  if (collected === undefined || fees.weth <= 0n) {
+    throw new LaunchError("Les frais d'échange n'ont pas été versés au Safe.");
   }
+
+  const status = await readLaunchStatus(ethers.provider, token.launcher);
 
   // 10. En dernier (le temps avancé ne concerne que cette copie locale) : la part
   //     bloquée se libère bien selon le calendrier, au bénéficiaire.
@@ -331,27 +281,14 @@ export async function runRehearsal(
     communitySafe,
     gasUsed: {
       vesting: await gasUsedBy(ethers, vestingRecord?.txHash),
-      curve: await gasUsedBy(ethers, token.txHash),
-      graduation: graduationReceipt.gasUsed,
+      launcher: await gasUsedBy(ethers, token.txHash),
     },
-    antiBot: { buyBeforeOpenBlocked, limitAtOpen, bigBuyBlocked, poolBigBuyBlocked },
+    distribution,
+    antiBot: { buyBeforeOpenBlocked, limitAtOpen, bigBuyBlocked, bigBuyAfter24h: { ethIn: bigIn, tokensOut: bigOut } },
     smallBuys: { buyers: buyerIndexes.length, ethIn: smallIn * BigInt(buyerIndexes.length), tokensOut: smallTokens },
     resale: { tokensIn, ethOut },
-    graduation: {
-      ethSent,
-      ethUsed: spent,
-      refunded: ethSent - spent,
-      pair: graduated.pair,
-      ethInPool: graduated.eth,
-      tokensInPool: graduated.tokens,
-      lpBurned: graduated.lp,
-      tokensBurned: graduated.burned,
-      vestingReceived,
-      communityReceived,
-    },
-    pool,
-    routerBuy: { ethIn: routerIn, tokensOut: routerOut },
+    fees,
+    status,
     vesting: vestingReport,
   };
 }
-

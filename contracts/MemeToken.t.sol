@@ -25,7 +25,7 @@ contract MemeTokenTest {
     uint256 private constant SUPPLY = 1_000_000_000;
 
     function _deploy(uint256 wholeTokens) private returns (MemeToken) {
-        return new MemeToken("Test Token", "TEST", wholeTokens, address(0), address(0));
+        return new MemeToken("Test Token", "TEST", wholeTokens, address(0), address(0), FEE, block.timestamp + 1 days);
     }
 
     // --- Émission initiale ---------------------------------------------------
@@ -119,113 +119,110 @@ contract MemeTokenTest {
         require(address(token).balance == 0, "aucun ETH ne doit rester sur le token");
     }
 
-    // --- Anti-bot : limite par wallet pendant 24 h après l'ouverture du pool ---
+    // --- Ouverture à heure fixe et anti-bot ------------------------------------
 
     address private constant WETH = address(0xE7);
     address private constant BOT = address(0xB07);
+    uint24 private constant FEE = 10_000;
+    uint256 private constant OPEN = 2_000_000;
 
-    function _launch() private returns (MemeToken token, address pair) {
+    function _launch() private returns (MemeToken token, address pool) {
+        vm.warp(OPEN - 1 days);
         MockPairFactory factory = new MockPairFactory();
-        token = new MemeToken("Test Token", "TEST", SUPPLY, address(factory), WETH);
-        pair = token.PAIR();
-        require(pair != address(0) && factory.getPair(address(token), WETH) == pair, "paire creee au deploiement");
+        token = new MemeToken("Test Token", "TEST", SUPPLY, address(factory), WETH, FEE, OPEN);
+        pool = token.PAIR();
+        require(pool != address(0) && factory.getPool(address(token), WETH, FEE) == pool, "pool cree au deploiement");
     }
 
-    function test_NoLimitBeforePoolOpens() public {
-        (MemeToken token,) = _launch();
-        require(token.launchedAt() == 0 && token.walletLimit() == type(uint256).max, "pas de limite avant le pool");
-        // blocage de la part et reserve communaute : envoyes avant l'ouverture, sans limite
+    function test_ClosedBeforeOpenAt() public {
+        (MemeToken token, address pool) = _launch();
+        require(token.LAUNCHER() == address(this) && token.OPEN_AT() == OPEN, "lanceur et heure");
+        require(token.walletLimit() == type(uint256).max, "pas de limite avant l'ouverture");
+        // Part bloquée et réserve : envoyées avant l'ouverture, sans limite.
         require(token.transfer(address(0x7E57), (SUPPLY * UNIT) / 10), "10 % bloques");
-        require(token.transfer(address(0x5AFE), (SUPPLY * UNIT * 3) / 100), "3 % reserve");
-    }
-
-    function test_FirstTransferToPairStartsLimit() public {
-        (MemeToken token, address pair) = _launch();
-        vm.warp(1_000_000);
-        require(token.transfer(pair, (SUPPLY * UNIT * 87) / 100), "87 % dans le pool");
-        require(token.launchedAt() == 1_000_000, "ouverture notee");
-        require(token.walletLimit() == (SUPPLY * UNIT) / 200, "0,5 % la premiere heure");
-        vm.warp(1_000_000 + 3 hours);
-        require(token.transfer(pair, 1), "un second envoi ne change pas l'ouverture");
-        require(token.launchedAt() == 1_000_000, "ouverture inchangee");
-    }
-
-    function test_OnlyLauncherOpensThePool() public {
-        (MemeToken token, address pair) = _launch();
-        require(token.LAUNCHER() == address(this), "lanceur = deployeur");
-        require(token.transfer(BOT, 1000), "envoi avant ouverture");
+        require(token.transfer(BOT, (SUPPLY * UNIT) * 3 / 100), "3 % reserve");
+        // Seul le lanceur alimente le pool ; rien n'en sort avant OPEN_AT.
         vm.prank(BOT);
         vm.expectRevert(abi.encodeWithSelector(MemeToken.PoolNotOpen.selector));
-        token.transfer(pair, 1000);
-        require(token.launchedAt() == 0, "toujours ferme");
-        require(token.transfer(pair, 1), "le lanceur ouvre");
+        token.transfer(pool, 1);
+        require(token.transfer(pool, (SUPPLY * UNIT * 87) / 100), "le lanceur place la liquidite");
+        vm.prank(pool);
+        vm.expectRevert(abi.encodeWithSelector(MemeToken.PoolNotOpen.selector));
+        token.transfer(BOT, 1);
+        // La réserve ne peut rien envoyer ailleurs non plus (pas d'autre marché avant l'heure).
         vm.prank(BOT);
-        require(token.transfer(pair, 1000), "ensuite tout le monde");
+        vm.expectRevert(abi.encodeWithSelector(MemeToken.PoolNotOpen.selector));
+        token.transfer(address(0xA11CE), 1);
+        vm.warp(OPEN);
+        vm.prank(pool);
+        require(token.transfer(address(0xA11CE), 1000), "achat a l'heure");
+        vm.prank(BOT);
+        require(token.transfer(pool, 1000), "vente au pool apres l'ouverture");
     }
 
     function test_LimitStepsThenDisappears() public {
-        (MemeToken token, address pair) = _launch();
-        vm.warp(1_000_000);
-        require(token.transfer(pair, (SUPPLY * UNIT * 87) / 100), "pool");
+        (MemeToken token, address pool) = _launch();
+        require(token.transfer(pool, (SUPPLY * UNIT * 87) / 100), "pool");
         uint256 total = SUPPLY * UNIT;
+        vm.warp(OPEN);
+        require(token.walletLimit() == total / 200, "0,5 % la premiere heure");
 
-        vm.prank(pair);
+        vm.prank(pool);
         require(token.transfer(BOT, total / 200), "0,5 % pile accepte");
-        vm.prank(pair);
+        vm.prank(pool);
         vm.expectRevert(abi.encodeWithSelector(MemeToken.WalletLimit.selector, total / 200));
         token.transfer(BOT, 1);
 
-        vm.warp(1_000_000 + 1 hours);
+        vm.warp(OPEN + 1 hours);
         require(token.walletLimit() == total / 100, "1 % apres 1 h");
-        vm.prank(pair);
+        vm.prank(pool);
         require(token.transfer(BOT, total / 200), "jusqu'a 1 %");
-        vm.prank(pair);
+        vm.prank(pool);
         vm.expectRevert(abi.encodeWithSelector(MemeToken.WalletLimit.selector, total / 100));
         token.transfer(BOT, 1);
 
-        vm.warp(1_000_000 + 6 hours);
+        vm.warp(OPEN + 6 hours);
         require(token.walletLimit() == total / 50, "2 % apres 6 h");
-        vm.prank(pair);
+        vm.prank(pool);
         require(token.transfer(BOT, total / 100), "jusqu'a 2 %");
-        vm.prank(pair);
+        vm.prank(pool);
         vm.expectRevert(abi.encodeWithSelector(MemeToken.WalletLimit.selector, total / 50));
         token.transfer(BOT, 1);
 
-        vm.warp(1_000_000 + 24 hours - 1);
+        vm.warp(OPEN + 24 hours - 1);
         require(token.walletLimit() == total / 50, "toujours 2 % juste avant 24 h");
-        vm.warp(1_000_000 + 24 hours);
+        vm.warp(OPEN + 24 hours);
         require(token.walletLimit() == type(uint256).max, "plus de limite apres 24 h");
-        vm.prank(pair);
+        vm.prank(pool);
         require(token.transfer(BOT, total / 10), "achat libre apres 24 h");
     }
 
-    function test_LimitAlsoAppliesBetweenWallets() public {
-        (MemeToken token, address pair) = _launch();
+    function test_LimitAlsoAppliesBetweenWalletsButNotToPoolOrDead() public {
+        (MemeToken token, address pool) = _launch();
         require(token.transfer(address(0xA11CE), (SUPPLY * UNIT) / 10), "avant l'ouverture : libre");
-        require(token.transfer(pair, (SUPPLY * UNIT * 87) / 100), "pool");
+        vm.warp(OPEN);
         vm.prank(address(0xA11CE));
         vm.expectRevert(abi.encodeWithSelector(MemeToken.WalletLimit.selector, (SUPPLY * UNIT) / 200));
         token.transfer(BOT, (SUPPLY * UNIT) / 200 + 1);
-        // vendre au pool reste toujours possible, quelle que soit la quantite
+        // Vendre au pool, ou brûler, reste toujours possible, quelle que soit la quantité.
         vm.prank(address(0xA11CE));
-        require(token.transfer(pair, (SUPPLY * UNIT) / 10), "vente au pool libre");
+        require(token.transfer(pool, (SUPPLY * UNIT) / 20), "vente au pool libre");
+        vm.prank(address(0xA11CE));
+        require(token.transfer(address(0xdEaD), (SUPPLY * UNIT) / 20), "brulage libre");
     }
 
-    function test_ReusesPairCreatedByThirdParty() public {
+    function test_RefusesPoolCreatedByThirdParty() public {
         MockPairFactory factory = new MockPairFactory();
-        // adresse du prochain contrat cree par ce test (nonce courant du contrat de test)
         address predicted = _nextAddress(address(this));
-        factory.setPair(predicted, WETH, address(0xFA1C));
-        MemeToken token = new MemeToken("Test Token", "TEST", SUPPLY, address(factory), WETH);
-        require(address(token) == predicted, "prediction");
-        require(token.PAIR() == address(0xFA1C), "paire existante reprise, pas de blocage");
+        factory.setPool(predicted, WETH, FEE, address(0xFA1C));
+        vm.expectRevert(abi.encodeWithSelector(MemeToken.PoolAlreadyExists.selector, address(0xFA1C)));
+        new MemeToken("Test Token", "TEST", SUPPLY, address(factory), WETH, FEE, block.timestamp + 1 days);
     }
 
-    function test_NoFactoryMeansNoLimit() public {
+    function test_NoFactoryMeansNoPool() public {
         MemeToken token = _deploy(SUPPLY);
-        require(token.PAIR() == address(0), "pas de paire");
-        require(token.transfer(BOT, (SUPPLY * UNIT) / 2), "transfert libre");
-        require(token.launchedAt() == 0 && token.walletLimit() == type(uint256).max, "jamais de limite");
+        require(token.PAIR() == address(0), "pas de pool");
+        require(token.transfer(BOT, (SUPPLY * UNIT) / 2), "transfert libre avant l'heure");
     }
 
     function _nextAddress(address deployer) private view returns (address) {

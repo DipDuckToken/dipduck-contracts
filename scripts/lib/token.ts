@@ -1,13 +1,13 @@
 import type { HardhatEthers } from "@nomicfoundation/hardhat-ethers/types";
-import { type Signer, ZeroAddress } from "ethers";
+import { type Signer, ZeroAddress, getCreate2Address, keccak256 } from "ethers";
 
 import type { GameRecord, NftRecord, TokenRecord, VestingRecord } from "./records.ts";
 import { GAS_MARGIN_PERCENT } from "./tx.ts";
-import type { TokenParams } from "./validation.ts";
+import { POOL_FEE } from "./uniswap.ts";
 
 /** Noms complets des contrats, utilisés aussi pour la vérification sur Blockscout. */
 export const TOKEN_CONTRACT = "contracts/MemeToken.sol:MemeToken";
-export const CURVE_CONTRACT = "contracts/LaunchCurve.sol:LaunchCurve";
+export const LAUNCHER_CONTRACT = "contracts/LaunchPool.sol:LaunchPool";
 export const VESTING_CONTRACT = "contracts/TokenVesting.sol:TokenVesting";
 export const NFT_CONTRACT = "contracts/DipDuckCards.sol:DipDuckCards";
 export const GAME_CONTRACT = "contracts/DipDuckGame.sol:DipDuckGame";
@@ -54,30 +54,31 @@ export function gameConstructorArgs(
   ];
 }
 
-/** Paramètres de LaunchCurve.Config, dans l'ordre du contrat (montants de tokens en tokens entiers). */
-export type CurveConfigTuple = [bigint, string, bigint, string, bigint, bigint, bigint, bigint, string, string];
+/** Paramètres de LaunchPool.Config, dans l'ordre du contrat (montants de tokens en tokens entiers). */
+export type LaunchConfigTuple = [bigint, string, bigint, string, bigint, string, number, bigint, string];
+
+type LaunchFields = Pick<
+  TokenRecord,
+  | "name"
+  | "symbol"
+  | "supplyWholeTokens"
+  | "vesting"
+  | "vestingWholeTokens"
+  | "community"
+  | "communityWholeTokens"
+  | "feeRecipient"
+  | "startTick"
+  | "openAt"
+  | "positionManager"
+  | "salt"
+>;
 
 /**
- * Arguments du constructeur de LaunchCurve : nom, symbole, puis Config (offre, blocage et sa part,
- * Safe communauté et sa réserve, ETH virtuel, cible, heure d'ouverture, factory, WETH).
+ * Arguments du constructeur de LaunchPool : nom, symbole, Config (offre, blocage et sa part,
+ * Safe communauté et sa réserve, destinataire des frais, tick de départ, ouverture,
+ * gestionnaire de positions), puis le sel CREATE2 du token.
  */
-export function curveConstructorArgs(
-  token: Pick<
-    TokenRecord,
-    | "name"
-    | "symbol"
-    | "supplyWholeTokens"
-    | "vesting"
-    | "vestingWholeTokens"
-    | "community"
-    | "communityWholeTokens"
-    | "virtualEthWei"
-    | "targetEthWei"
-    | "openAt"
-    | "factory"
-    | "weth"
-  >,
-): [string, string, CurveConfigTuple] {
+export function launcherConstructorArgs(token: LaunchFields): [string, string, LaunchConfigTuple, string] {
   return [
     token.name,
     token.symbol,
@@ -87,12 +88,12 @@ export function curveConstructorArgs(
       BigInt(token.vestingWholeTokens),
       token.community,
       BigInt(token.communityWholeTokens),
-      BigInt(token.virtualEthWei),
-      BigInt(token.targetEthWei),
+      token.feeRecipient,
+      token.startTick,
       BigInt(token.openAt),
-      token.factory,
-      token.weth,
+      token.positionManager,
     ],
+    token.salt,
   ];
 }
 
@@ -104,21 +105,25 @@ export function vestingConstructorArgs(
 }
 
 /**
- * Arguments du constructeur de MemeToken, dans l'ordre : nom, symbole, offre, factory, WETH.
- * Le token est créé par la courbe avec ces arguments : ils servent à le vérifier sur Blockscout.
+ * Arguments du constructeur de MemeToken, dans l'ordre : nom, symbole, offre, factory v3,
+ * WETH, niveau de frais (1 %), heure d'ouverture. Le token est créé par le lanceur avec
+ * ces arguments : ils servent à prédire son adresse et à le vérifier sur Blockscout.
  */
-export function constructorArgs(params: TokenParams): [string, string, bigint, string, string] {
-  return [params.name, params.symbol, params.supply, params.factory ?? ZeroAddress, params.weth ?? ZeroAddress];
+export function tokenConstructorArgs(
+  token: Pick<TokenRecord, "name" | "symbol" | "supplyWholeTokens" | "factory" | "weth" | "openAt">,
+): [string, string, bigint, string, string, number, bigint] {
+  return [token.name, token.symbol, BigInt(token.supplyWholeTokens), token.factory, token.weth, POOL_FEE, BigInt(token.openAt)];
 }
 
-export function paramsOf(record: TokenRecord): TokenParams {
-  return {
-    name: record.name,
-    symbol: record.symbol,
-    supply: BigInt(record.supplyWholeTokens),
-    factory: record.factory,
-    weth: record.weth,
-  };
+/** Adresse du token que créera le lanceur : CREATE2 (lanceur, sel, keccak du code + arguments). */
+export async function predictTokenAddress(
+  ethers: HardhatEthers,
+  launcher: string,
+  token: Pick<TokenRecord, "name" | "symbol" | "supplyWholeTokens" | "factory" | "weth" | "openAt" | "salt">,
+): Promise<string> {
+  const factory = await ethers.getContractFactory(TOKEN_CONTRACT);
+  const { data } = await factory.getDeployTransaction(...tokenConstructorArgs(token));
+  return getCreate2Address(launcher, token.salt, keccak256(data));
 }
 
 export interface DeploymentEstimate {

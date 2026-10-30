@@ -41,45 +41,48 @@ export interface JournaledTx {
 }
 
 /**
- * Déploiement de la courbe de lancement (LaunchCurve), qui crée elle-même le token
- * et garde 100 % de l'offre jusqu'à l'ouverture du pool.
+ * Déploiement du lanceur (LaunchPool), qui crée le token (CREATE2), verse ta part
+ * et la réserve, puis crée le pool Uniswap v3 et y place tout le reste.
  */
 export interface TokenRecord extends JournaledTx {
-  /** Adresse du TOKEN : 1er contrat créé par la courbe (CREATE : courbe + nonce 1), connue avant diffusion. */
+  /** Adresse du TOKEN (CREATE2 : lanceur + sel + code), connue avant diffusion. */
   address: string;
   name: string;
   symbol: string;
   supplyWholeTokens: string;
-  /** Factory et WETH Uniswap v2 de la paire. */
+  /** Gestionnaire de positions Uniswap v3, et la factory et le WETH qu'il annonce. */
+  positionManager: string;
   factory: string;
   weth: string;
-  /** Adresse de la courbe (CREATE : déployeur + nonce), connue avant diffusion. */
-  curve: string;
-  /** Part de l'offre confiée à la courbe (curve.tokenPercent au déploiement). */
-  curveTokenPercent: number;
-  curveWholeTokens: string;
-  /** Contrat de blocage qui recevra ta part à l'ouverture du pool (adresse 0 = aucun). */
+  /** Adresse du lanceur (CREATE : déployeur + nonce), connue avant diffusion. */
+  launcher: string;
+  /** Sel CREATE2 du token, tiré au hasard au moment de signer. */
+  salt: string;
+  /** Contrat de blocage qui reçoit ta part au déploiement (adresse 0 = aucun). */
   vesting: string;
   vestingWholeTokens: string;
-  /** Safe communauté qui recevra la réserve à l'ouverture du pool (adresse 0 = aucune). */
+  /** Safe communauté qui reçoit la réserve au déploiement (adresse 0 = aucune). */
   community: string;
   communityWholeTokens: string;
-  virtualEthWei: string;
-  targetEthWei: string;
-  /** Horodatage Unix (s) de l'ouverture des achats. */
+  /** Reçoit les frais d'échange de la position (le Safe communauté). */
+  feeRecipient: string;
+  /** Prix de départ en tick « WETH par token », multiple de 200. */
+  startTick: number;
+  /** Horodatage Unix (s) de l'ouverture des échanges. */
   openAt: string;
-  /** Paire Uniswap v2 TOKEN/WETH, lue après confirmation. */
-  pair?: string;
+  /** Pool Uniswap v3 et numéro de la position, lus après confirmation. */
+  pool?: string;
+  positionId?: string;
 }
 
 /**
- * Contrat de vesting qui recevra ta part à l'ouverture du pool. Déployé AVANT la
- * courbe (il ne dépend pas du token) : la courbe connaît son adresse dès le départ.
+ * Contrat de vesting qui reçoit ta part. Déployé AVANT le lanceur (il ne dépend
+ * pas du token) : le lanceur lui verse la part dès son déploiement.
  */
 export interface VestingRecord extends JournaledTx {
   address: string;
   beneficiary: string;
-  /** Arguments du constructeur : début (horodatage Unix = ouverture des achats), durée et falaise en secondes. */
+  /** Arguments du constructeur : début (horodatage Unix = ouverture des échanges), durée et falaise en secondes. */
   start: string;
   durationSeconds: string;
   cliffSeconds: string;

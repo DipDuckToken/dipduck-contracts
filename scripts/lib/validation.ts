@@ -1,57 +1,43 @@
 import { ZeroAddress, getAddress, parseEther } from "ethers";
 
-import { DEAD_ADDRESS, MAX_WHOLE_TOKENS, UNIT } from "./constants.ts";
+import { DEAD_ADDRESS, MAX_WHOLE_TOKENS } from "./constants.ts";
+import { LaunchError } from "./errors.ts";
 import {
   DEFAULT_OPEN_DELAY_SECONDS,
   MAX_OPEN_DELAY_SECONDS,
   MIN_OPEN_DELAY_MAINNET_SECONDS,
   MIN_OPEN_DELAY_SECONDS,
-  curveReserves,
-  curveWholeTokensFor,
+  MIN_START_TICK,
   formatOpenAt,
-} from "./curve.ts";
-import { LaunchError } from "./errors.ts";
+  startTickFor,
+} from "./launch.ts";
 
 export interface TokenParams {
   name: string;
   symbol: string;
   /** Offre en tokens entiers. */
   supply: bigint;
-  /**
-   * Factory et WETH Uniswap v2 : le token crée sa paire au déploiement et y attache
-   * la limite anti-bot des 24 premières heures. Absents = pas de paire, pas de limite
-   * (testnet sans Uniswap, tests).
-   */
-  factory?: string;
-  weth?: string;
 }
 
-/** Section `curve` de launch.config.ts. */
-export interface CurveParams {
-  /** Part de l'offre confiée à la courbe (vendue + pool), en %. */
-  tokenPercent: number;
-  /** Réserve d'ETH virtuelle, en ETH (ex. "2"). */
-  virtualEth: string;
-  /** ETH à réunir pour ouvrir le pool, en ETH (ex. "3"). */
-  targetEth: string;
-  /** Heure d'ouverture des achats, date ISO en UTC ; vide = dans 2 h (hors mainnet seulement). */
+/** Section `pool` de launch.config.ts. */
+export interface PoolParams {
+  /** Capitalisation de départ voulue, en ETH (ex. "3") : elle fixe le prix de départ. */
+  startMarketCapEth: string;
+  /** Heure d'ouverture des échanges, date ISO en UTC ; vide = dans 2 h (hors mainnet seulement). */
   openAt: string;
 }
 
-export interface ValidatedCurve {
-  tokenPercent: bigint;
-  /** Tokens entiers confiés à la courbe : tokenPercent de l'offre, arrondi inférieur. */
-  curveWholeTokens: bigint;
-  virtualEthWei: bigint;
-  targetEthWei: bigint;
-  /** Horodatage Unix (s) de l'ouverture des achats. */
+export interface ValidatedPool {
+  startMarketCapWei: bigint;
+  /** Prix de départ en tick « WETH par token », multiple de 200. */
+  startTick: number;
+  /** Horodatage Unix (s) de l'ouverture des échanges. */
   openAt: bigint;
 }
 
-/** Bornes « raisonnables » de la config (le contrat accepte plus large) : une faute de frappe ne passe pas. */
-const MIN_CURVE_ETH = parseEther("0.01");
-const MAX_VIRTUAL_ETH = parseEther("1000");
-const MAX_TARGET_ETH = parseEther("10000");
+/** Bornes « raisonnables » de la capitalisation de départ : une faute de frappe ne passe pas. */
+const MIN_START_CAP = parseEther("0.01");
+const MAX_START_CAP = parseEther("1000000");
 
 export interface VestingParams {
   enabled: boolean;
@@ -61,6 +47,8 @@ export interface VestingParams {
   cliffDays: number;
   /** Adresse qui reçoit les tokens libérés ; vide = le wallet de déploiement. */
   beneficiary: string;
+  /** Ta part, en % de l'offre (0 à 99). */
+  percent?: number;
 }
 
 export interface CommunityParams {
@@ -72,7 +60,7 @@ export interface CommunityParams {
 
 export interface ValidatedCommunity {
   percent: bigint;
-  /** Absent quand percent vaut 0. */
+  /** Safe communauté (absent quand aucun n'est donné). */
   beneficiary?: string;
 }
 
@@ -135,7 +123,7 @@ export function validateTokenParams(
   if (params.supply < 1n || params.supply > MAX_WHOLE_TOKENS) {
     problems.push(
       `l'offre doit être comprise entre 1 et ${MAX_WHOLE_TOKENS} tokens ` +
-        "(borne uint112 des réserves Uniswap v2)",
+        "(borne uint112, qui tient aussi dans un u128)",
     );
   }
   if (containsRobinhoodMark(params.name) || containsRobinhoodMark(params.symbol)) {
@@ -162,43 +150,37 @@ export function parseIsoDate(value: string): bigint | undefined {
   return BigInt(Math.floor(parsed / 1000));
 }
 
-function parseEthAmount(label: string, value: string, problems: string[]): bigint | undefined {
-  try {
-    return parseEther(value.trim());
-  } catch {
-    problems.push(`${label} invalide : "${value}" (attendu un nombre en ETH, ex. "2" ou "0.5")`);
-    return undefined;
-  }
-}
-
 /**
- * Paramètres de la courbe de lancement. `now` est l'heure du dernier bloc :
- * l'ouverture doit être dans le futur (au moins 1 h sur le mainnet, pour
- * bloquer ta part et annoncer l'heure), à 30 jours au plus, comme l'exige le contrat.
+ * Paramètres du pool. `now` est l'heure du dernier bloc : l'ouverture doit être
+ * dans le futur (au moins 1 h sur le mainnet, pour vérifier les contrats et
+ * annoncer l'heure), à 30 jours au plus, comme l'exige le contrat. Le tick de
+ * départ découle de la capitalisation voulue.
  */
-export function validateCurveParams(
-  params: CurveParams,
+export function validatePoolParams(
+  params: PoolParams,
   options: { supplyWholeTokens: bigint; now: bigint; isMainnet: boolean },
-): ValidatedCurve {
+): ValidatedPool {
   const problems: string[] = [];
   const { now, isMainnet } = options;
 
-  if (!Number.isInteger(params.tokenPercent) || params.tokenPercent < 1 || params.tokenPercent > 100) {
-    problems.push("curve.tokenPercent doit être un nombre entier entre 1 et 100");
+  let startMarketCapWei = 0n;
+  let startTick = 0;
+  try {
+    startMarketCapWei = parseEther(params.startMarketCapEth.trim());
+  } catch {
+    problems.push(`pool.startMarketCapEth invalide : "${params.startMarketCapEth}" (attendu un nombre en ETH, ex. "3")`);
   }
-  const virtualEthWei = parseEthAmount("curve.virtualEth", params.virtualEth, problems);
-  const targetEthWei = parseEthAmount("curve.targetEth", params.targetEth, problems);
-  if (virtualEthWei !== undefined && (virtualEthWei < MIN_CURVE_ETH || virtualEthWei > MAX_VIRTUAL_ETH)) {
-    problems.push("curve.virtualEth doit être compris entre 0.01 et 1000 ETH (il fixe le prix de départ)");
-  }
-  if (targetEthWei !== undefined && (targetEthWei < MIN_CURVE_ETH || targetEthWei > MAX_TARGET_ETH)) {
-    problems.push("curve.targetEth doit être compris entre 0.01 et 10000 ETH (il part en entier dans le pool)");
-  }
-  const tokenPercent = BigInt(Number.isInteger(params.tokenPercent) ? params.tokenPercent : 0);
-  const curveWholeTokens = curveWholeTokensFor(options.supplyWholeTokens, tokenPercent);
-  if (problems.length === 0 && virtualEthWei !== undefined && targetEthWei !== undefined) {
-    if (curveReserves(curveWholeTokens * UNIT, virtualEthWei, targetEthWei) === undefined) {
-      problems.push("la courbe refuserait cette combinaison (offre, curve.tokenPercent, virtualEth, targetEth) : trop peu de tokens");
+  if (problems.length === 0) {
+    if (startMarketCapWei < MIN_START_CAP || startMarketCapWei > MAX_START_CAP) {
+      problems.push("pool.startMarketCapEth doit être compris entre 0.01 et 1000000 ETH (il fixe le prix de départ)");
+    } else {
+      startTick = startTickFor(startMarketCapWei, options.supplyWholeTokens);
+      if (startTick >= 0 || startTick <= MIN_START_TICK) {
+        problems.push(
+          "pool.startMarketCapEth donne un prix de départ hors des bornes du contrat pour cette offre " +
+            "(au moins 1 ETH par token, ou prix quasi nul) : change la capitalisation ou l'offre",
+        );
+      }
     }
   }
 
@@ -206,37 +188,46 @@ export function validateCurveParams(
   const minDelay = isMainnet ? MIN_OPEN_DELAY_MAINNET_SECONDS : MIN_OPEN_DELAY_SECONDS;
   if (params.openAt.trim() === "") {
     if (isMainnet) {
-      problems.push('curve.openAt est obligatoire sur le mainnet (date ISO en UTC, ex. "2026-12-01T20:00:00Z")');
+      problems.push('pool.openAt est obligatoire sur le mainnet (date ISO en UTC, ex. "2026-12-01T20:00:00Z")');
     }
   } else {
     const parsed = parseIsoDate(params.openAt);
     if (parsed === undefined) {
-      problems.push(`curve.openAt n'est pas une date ISO avec fuseau (ex. "2026-12-01T20:00:00Z") : "${params.openAt}"`);
+      problems.push(`pool.openAt n'est pas une date ISO avec fuseau (ex. "2026-12-01T20:00:00Z") : "${params.openAt}"`);
     } else {
       openAt = parsed;
       if (parsed <= now) {
-        problems.push(`curve.openAt (${formatOpenAt(parsed)}) est déjà passée`);
+        problems.push(`pool.openAt (${formatOpenAt(parsed)}) est déjà passée`);
       } else if (parsed < now + minDelay) {
         problems.push(
-          `curve.openAt (${formatOpenAt(parsed)}) est trop proche : au moins ${minDelay / 60n} minutes après maintenant, ` +
+          `pool.openAt (${formatOpenAt(parsed)}) est trop proche : au moins ${minDelay / 60n} minutes après maintenant, ` +
             "pour vérifier les contrats et annoncer l'heure avant l'ouverture",
         );
       } else if (parsed > now + MAX_OPEN_DELAY_SECONDS) {
-        problems.push(`curve.openAt (${formatOpenAt(parsed)}) est à plus de 30 jours : le contrat le refuserait`);
+        problems.push(`pool.openAt (${formatOpenAt(parsed)}) est à plus de 30 jours : le contrat le refuserait`);
       }
     }
   }
 
   if (problems.length > 0) {
-    throw new LaunchError(`Paramètres de la courbe invalides :\n  - ${problems.join("\n  - ")}`);
+    throw new LaunchError(`Paramètres du pool invalides :\n  - ${problems.join("\n  - ")}`);
   }
-  return {
-    tokenPercent,
-    curveWholeTokens,
-    virtualEthWei: virtualEthWei as bigint,
-    targetEthWei: targetEthWei as bigint,
-    openAt,
-  };
+  return { startMarketCapWei, startTick, openAt };
+}
+
+/** Ta part, en % de l'offre : un entier de 0 à 99, qui n'existe que bloquée. */
+export function validateVestingPercent(params: Pick<VestingParams, "percent" | "enabled">): bigint {
+  const percent = params.percent ?? 0;
+  if (!Number.isInteger(percent) || percent < 0 || percent > 99) {
+    throw new LaunchError("vesting.percent doit être un nombre entier entre 0 et 99.");
+  }
+  if (percent > 0 && !params.enabled) {
+    throw new LaunchError(
+      `Ta part (${percent} % de l'offre) ne peut exister que bloquée : mets vesting.enabled: true, ou vesting.percent: 0. ` +
+        "Rien n'a été envoyé.",
+    );
+  }
+  return BigInt(percent);
 }
 
 /** Casse mixte (somme de contrôle EIP-55) : une faute de frappe dans l'adresse serait détectée. */
@@ -246,27 +237,28 @@ function hasChecksumCase(address: string): boolean {
 }
 
 /**
- * Réserve communauté : un pourcentage entier de l'offre, envoyé à un wallet
- * neuf et public. Le contrôle « pas un contrat » demande la chaîne : il est
- * fait par le script de blocage, avant tout envoi.
+ * Réserve communauté : un pourcentage entier de l'offre, versé au déploiement à
+ * un Safe dédié, qui reçoit aussi les frais d'échange du pool. Le contrôle
+ * « vrai Safe » demande la chaîne : il est fait par le script de déploiement.
+ * `vestingPercent` : ta part, pour vérifier qu'il reste quelque chose pour le pool.
  */
 export function validateCommunityParams(
   params: CommunityParams,
   deployer: string,
-  tokenPercent: bigint,
+  vestingPercent: bigint,
 ): ValidatedCommunity {
   const problems: string[] = [];
   if (!Number.isInteger(params.percent) || params.percent < 0 || params.percent > 99) {
     problems.push("community.percent doit être un nombre entier entre 0 et 99");
-  } else if (tokenPercent + BigInt(params.percent) > 100n) {
+  } else if (vestingPercent + BigInt(params.percent) > 99n) {
     problems.push(
-      `curve.tokenPercent (${tokenPercent}) + community.percent (${params.percent}) dépasse 100 : ` +
-        "la courbe et la réserve ne peuvent pas recevoir plus que l'offre",
+      `vesting.percent (${vestingPercent}) + community.percent (${params.percent}) dépasse 99 : ` +
+        "il ne resterait rien pour le pool",
     );
   }
   const requested = params.beneficiary.trim();
   let beneficiary: string | undefined;
-  if (problems.length === 0 && params.percent > 0) {
+  if (problems.length === 0 && (params.percent > 0 || requested !== "")) {
     const advice = "utilise un Safe 2 sur 3 dédié à la communauté (app.safe.global)";
     if (requested === "") {
       problems.push(`community.beneficiary est obligatoire quand community.percent > 0 : ${advice}`);
@@ -293,7 +285,7 @@ export function validateCommunityParams(
   if (problems.length > 0) {
     throw new LaunchError(`Paramètres de la réserve communauté invalides :\n  - ${problems.join("\n  - ")}`);
   }
-  return { percent: BigInt(params.percent), beneficiary: params.percent > 0 ? beneficiary : undefined };
+  return { percent: BigInt(params.percent), beneficiary };
 }
 
 /**

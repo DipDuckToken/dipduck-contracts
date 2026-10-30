@@ -8,19 +8,22 @@ import {
   ZeroAddress,
   getAddress,
   getCreateAddress,
+  hexlify,
+  randomBytes,
 } from "ethers";
 
 import { RECEIPT_TIMEOUT_MS, UNIT } from "./constants.ts";
-import { CURVE_ABI, MAX_OPEN_DELAY_SECONDS, formatOpenAt } from "./curve.ts";
+import { LAUNCHER_ABI, MAX_OPEN_DELAY_SECONDS, formatOpenAt } from "./launch.ts";
 import { LaunchError } from "./errors.ts";
 import type { GameRecord, Journal, JournaledTx, LaunchRecord, NftRecord, TokenRecord, VestingRecord } from "./records.ts";
 import type { Genesis } from "./genesis.ts";
 import {
-  CURVE_CONTRACT,
+  LAUNCHER_CONTRACT,
   GAME_CONTRACT,
   NFT_CONTRACT,
   VESTING_CONTRACT,
-  curveConstructorArgs,
+  launcherConstructorArgs,
+  predictTokenAddress,
   gameConstructorArgs,
   nftConstructorArgs,
   vestingConstructorArgs,
@@ -58,7 +61,7 @@ export interface StepContext {
   receiptTimeoutMs?: number;
 }
 
-const curveInterface = new Interface(CURVE_ABI);
+const launcherInterface = new Interface(LAUNCHER_ABI);
 
 function now(): string {
   return new Date().toISOString();
@@ -346,36 +349,39 @@ function revertDataOf(error: unknown): string | undefined {
   return undefined;
 }
 
-/** Raison lisible d'un refus de la courbe (ou, à défaut, la première ligne de l'erreur). */
+/** Raison lisible d'un refus du lanceur ou du token (ou, à défaut, la première ligne de l'erreur). */
 export function describeRevert(error: unknown): string {
   const data = revertDataOf(error);
   let parsed: ReturnType<Interface["parseError"]> = null;
   try {
-    parsed = data === undefined ? null : curveInterface.parseError(data);
+    parsed = data === undefined ? null : launcherInterface.parseError(data);
   } catch {
     parsed = null;
   }
   if (parsed?.name === "InvalidParams") {
     return (
-      "la courbe refuse ses paramètres (heure d'ouverture passée ou à plus de 30 jours, contrat de blocage " +
-      "ou Safe sans code, ou répartition impossible)"
+      "le lanceur refuse ses paramètres (heure d'ouverture passée ou à plus de 30 jours, tick de départ, " +
+      "contrat de blocage ou Safe sans code, ou répartition impossible)"
     );
+  }
+  if (parsed?.name === "PoolAlreadyExists") {
+    return `un pool existe déjà pour ce token (${String(parsed.args[0])}) : relance, un nouveau sel sera tiré`;
   }
   if (parsed !== null) return `${parsed.name}(${parsed.args.join(", ")})`;
   return firstLine(error);
 }
 
-// --- Étape 1b : la courbe de lancement, qui crée le token ---------------------------
+// --- Étape 1b : le lanceur, qui crée le token et le pool ----------------------------
 
-/** Paramètres du déploiement de la courbe (montants de tokens en tokens entiers). */
+/** Paramètres du déploiement du lanceur (montants de tokens en tokens entiers). */
 export interface LaunchParams extends TokenParams {
+  positionManager: string;
+  /** Factory et WETH annoncés par le gestionnaire de positions. */
   factory: string;
   weth: string;
-  curveTokenPercent: bigint;
-  curveWholeTokens: bigint;
-  virtualEthWei: bigint;
-  targetEthWei: bigint;
-  /** Horodatage Unix (s) de l'ouverture des achats. */
+  /** Prix de départ en tick « WETH par token », multiple de 200. */
+  startTick: number;
+  /** Horodatage Unix (s) de l'ouverture des échanges. */
   openAt: bigint;
   /** Contrat de blocage déjà déployé (adresse 0 et 0 token = aucune part). */
   vesting: string;
@@ -383,6 +389,10 @@ export interface LaunchParams extends TokenParams {
   /** Safe communauté (adresse 0 et 0 token = aucune réserve). */
   community: string;
   communityWholeTokens: bigint;
+  /** Reçoit les frais d'échange de la position. */
+  feeRecipient: string;
+  /** Sel CREATE2 imposé (tests) ; sinon tiré au hasard au moment de signer. */
+  salt?: string;
 }
 
 /** Paramètres notés dans le journal (reprise d'un déploiement « pending »). */
@@ -391,40 +401,40 @@ export function launchParamsOf(token: TokenRecord): LaunchParams {
     name: token.name,
     symbol: token.symbol,
     supply: BigInt(token.supplyWholeTokens),
+    positionManager: token.positionManager,
     factory: token.factory,
     weth: token.weth,
-    curveTokenPercent: BigInt(token.curveTokenPercent),
-    curveWholeTokens: BigInt(token.curveWholeTokens),
-    virtualEthWei: BigInt(token.virtualEthWei),
-    targetEthWei: BigInt(token.targetEthWei),
+    startTick: token.startTick,
     openAt: BigInt(token.openAt),
     vesting: token.vesting,
     vestingWholeTokens: BigInt(token.vestingWholeTokens),
     community: token.community,
     communityWholeTokens: BigInt(token.communityWholeTokens),
+    feeRecipient: token.feeRecipient,
+    salt: token.salt,
   };
 }
 
 /**
- * La courbe et le token notés sont-ils sur la chaîne, avec les paramètres notés ?
- * Les deux adresses (CREATE) ne dépendent que du wallet et du nonce : seul le
+ * Le lanceur et le token notés sont-ils sur la chaîne, avec les paramètres notés ?
+ * Les deux adresses ne dépendent que du wallet, du nonce et du sel noté : seul le
  * déploiement noté peut s'y trouver.
  */
-async function curveMatches(ctx: StepContext, entry: TokenRecord): Promise<boolean> {
+async function launcherMatches(ctx: StepContext, entry: TokenRecord): Promise<boolean> {
   const provider = ctx.ethers.provider;
-  if ((await provider.getCode(entry.curve)) === "0x" || (await provider.getCode(entry.address)) === "0x") return false;
-  const curve = new Contract(entry.curve, CURVE_ABI, provider);
-  const [tokenAddress, openAt, virtualEth, targetEth] = (await Promise.all([
-    curve.TOKEN(),
-    curve.OPEN_AT(),
-    curve.VIRTUAL_ETH(),
-    curve.TARGET_ETH(),
-  ])) as [string, bigint, bigint, bigint];
+  if ((await provider.getCode(entry.launcher)) === "0x" || (await provider.getCode(entry.address)) === "0x") return false;
+  const launcher = new Contract(entry.launcher, LAUNCHER_ABI, provider);
+  const [tokenAddress, openAt, startTick, feeRecipient] = (await Promise.all([
+    launcher.TOKEN(),
+    launcher.OPEN_AT(),
+    launcher.START_TICK(),
+    launcher.FEE_RECIPIENT(),
+  ])) as [string, bigint, bigint, string];
   if (
     getAddress(tokenAddress) !== getAddress(entry.address) ||
     openAt !== BigInt(entry.openAt) ||
-    virtualEth !== BigInt(entry.virtualEthWei) ||
-    targetEth !== BigInt(entry.targetEthWei)
+    startTick !== BigInt(entry.startTick) ||
+    getAddress(feeRecipient) !== getAddress(entry.feeRecipient)
   ) {
     return false;
   }
@@ -438,21 +448,21 @@ async function curveMatches(ctx: StepContext, entry: TokenRecord): Promise<boole
 }
 
 /**
- * Déploie la courbe de lancement (qui crée le token et garde toute l'offre), ou
- * reprend un déploiement noté « pending ». La confirmation d'un premier envoi
- * est faite par l'appelant, après affichage du plan. Le journal note l'adresse
- * du token (1er contrat créé par la courbe) et celle de la courbe, toutes deux
+ * Déploie le lanceur (qui crée le token, verse ta part et la réserve, crée le pool
+ * Uniswap v3 et y place tout le reste), ou reprend un déploiement noté « pending ».
+ * La confirmation d'un premier envoi est faite par l'appelant, après affichage du
+ * plan. Le journal note le sel, l'adresse du lanceur et celle du token, toutes
  * connues avant la diffusion.
  */
 export async function deployTokenStep(ctx: StepContext, params: LaunchParams): Promise<TokenRecord> {
   const record = await loadRecord(ctx);
   const save = (token: TokenRecord) => ctx.journal.write({ ...record, token });
-  const factory = await ctx.ethers.getContractFactory(CURVE_CONTRACT);
-  const label = "le déploiement de la courbe";
+  const factory = await ctx.ethers.getContractFactory(LAUNCHER_CONTRACT);
+  const label = "le déploiement du lanceur";
 
   if (record.token?.status === "confirmed") {
     throw new LaunchError(
-      `Un token est déjà déployé sur ce réseau : ${record.token.address} (courbe ${record.token.curve}).\n` +
+      `Un token est déjà déployé sur ce réseau : ${record.token.address} (lanceur ${record.token.launcher}).\n` +
         `  Pour en déployer un autre volontairement, renomme d'abord ${ctx.journal.location}.`,
     );
   }
@@ -461,61 +471,67 @@ export async function deployTokenStep(ctx: StepContext, params: LaunchParams): P
   let receipt: TransactionReceipt | null;
   if (record.token?.status === "pending") {
     const pending = record.token;
-    const payload = { data: (await factory.getDeployTransaction(...curveConstructorArgs(pending))).data };
-    ({ entry, receipt } = await resumeJournaled(ctx, pending, payload, save, label, () => curveMatches(ctx, pending)));
+    const payload = { data: (await factory.getDeployTransaction(...launcherConstructorArgs(pending))).data };
+    ({ entry, receipt } = await resumeJournaled(ctx, pending, payload, save, label, () => launcherMatches(ctx, pending)));
   } else {
     // Dernier contrôle juste avant de signer : le contrat refuserait sinon (et l'annonce serait fausse).
     const latest = await ctx.ethers.provider.getBlock("latest");
     const nowSeconds = BigInt(latest?.timestamp ?? Math.floor(Date.now() / 1000));
     if (params.openAt <= nowSeconds + 60n) {
       throw new LaunchError(
-        `L'heure d'ouverture des achats (${formatOpenAt(params.openAt)}) est passée ou imminente : ` +
-          "choisis une nouvelle heure (curve.openAt) et relance. Rien n'a été envoyé.",
+        `L'heure d'ouverture des échanges (${formatOpenAt(params.openAt)}) est passée ou imminente : ` +
+          "choisis une nouvelle heure (pool.openAt) et relance. Rien n'a été envoyé.",
       );
     }
     if (params.openAt > nowSeconds + MAX_OPEN_DELAY_SECONDS) {
       throw new LaunchError(
-        `L'heure d'ouverture des achats (${formatOpenAt(params.openAt)}) est à plus de 30 jours : le contrat la refuserait. ` +
+        `L'heure d'ouverture des échanges (${formatOpenAt(params.openAt)}) est à plus de 30 jours : le contrat la refuserait. ` +
           "Rien n'a été envoyé.",
       );
-    }
-    if (params.supply - params.vestingWholeTokens - params.communityWholeTokens !== params.curveWholeTokens) {
-      throw new LaunchError("Répartition incohérente : courbe + ta part + réserve doit faire l'offre totale. Rien n'a été envoyé.");
     }
     const fields = {
       name: params.name,
       symbol: params.symbol,
       supplyWholeTokens: params.supply.toString(),
+      positionManager: getAddress(params.positionManager),
       factory: getAddress(params.factory),
       weth: getAddress(params.weth),
-      curveTokenPercent: Number(params.curveTokenPercent),
-      curveWholeTokens: params.curveWholeTokens.toString(),
+      // Sel tiré au hasard : personne ne peut prédire l'adresse du token (ni piéger son pool) avant la diffusion.
+      salt: params.salt ?? hexlify(randomBytes(32)),
       vesting: getAddress(params.vesting),
       vestingWholeTokens: params.vestingWholeTokens.toString(),
       community: getAddress(params.community),
       communityWholeTokens: params.communityWholeTokens.toString(),
-      virtualEthWei: params.virtualEthWei.toString(),
-      targetEthWei: params.targetEthWei.toString(),
+      feeRecipient: getAddress(params.feeRecipient),
+      startTick: params.startTick,
       openAt: params.openAt.toString(),
     };
-    const payload = { data: (await factory.getDeployTransaction(...curveConstructorArgs(fields))).data };
+    const payload = { data: (await factory.getDeployTransaction(...launcherConstructorArgs(fields))).data };
     try {
       await ctx.ethers.provider.call({ from: ctx.wallet.address, ...payload });
     } catch (error) {
-      throw new LaunchError(`La simulation du déploiement de la courbe a échoué : ${describeRevert(error)}. Rien n'a été envoyé.`);
+      throw new LaunchError(`La simulation du déploiement du lanceur a échoué : ${describeRevert(error)}. Rien n'a été envoyé.`);
     }
-    ctx.log("Déploiement de la courbe de lancement (elle crée le token)…");
+    ctx.log("Déploiement du lanceur (token, pool Uniswap v3, liquidité d'un seul côté)…");
+    // L'adresse du token se calcule avant la signature : seule l'adresse du lanceur (le nonce) manque.
+    const tokenFor = async (launcher: string) => await predictTokenAddress(ctx.ethers, launcher, fields);
+    const nonceHint = await freshNonce(ctx, record);
+    const predicted = await tokenFor(getCreateAddress({ from: ctx.wallet.address, nonce: nonceHint }));
     const prepared = await signAndRecord(
       ctx,
       record,
       payload,
       (base) => {
-        const curve = getCreateAddress({ from: base.from, nonce: base.nonce });
-        // Le token est le 1er contrat créé par la courbe (le nonce d'un contrat commence à 1).
-        return { ...base, address: getCreateAddress({ from: curve, nonce: 1 }), curve, ...fields };
+        const launcher = getCreateAddress({ from: base.from, nonce: base.nonce });
+        return { ...base, address: predicted, launcher, ...fields };
       },
       save,
     );
+    if (prepared.nonce !== nonceHint) {
+      // Le nonce a bougé entre-temps (RPC en retard) : l'adresse du token suit celle du lanceur.
+      prepared.address = await tokenFor(prepared.launcher);
+      await save(prepared);
+    }
     ({ entry, receipt } = await broadcastAndWait(ctx, prepared, payload, save, label));
   }
 
@@ -527,18 +543,20 @@ export async function deployTokenStep(ctx: StepContext, params: LaunchParams): P
   }
   const confirmedEntry = entry;
   const matches = await eventually(async () => {
-    if (!(await curveMatches(ctx, confirmedEntry))) throw new Error("pas encore visible");
+    if (!(await launcherMatches(ctx, confirmedEntry))) throw new Error("pas encore visible");
     return true;
   }).catch(() => false);
   if (!matches) {
     throw new LaunchError(
-      `La courbe attendue à ${entry.curve} (token ${entry.address}) n'est pas (encore) visible ou ne correspond pas au journal. ` +
+      `Le lanceur attendu à ${entry.launcher} (token ${entry.address}) n'est pas (encore) visible ou ne correspond pas au journal. ` +
         "Relance la commande dans un moment ; rien ne sera renvoyé.",
     );
   }
-  const pair = (await new Contract(entry.curve, CURVE_ABI, ctx.ethers.provider).PAIR().catch(() => undefined)) as
-    | string
-    | undefined;
+  const launcher = new Contract(entry.launcher, LAUNCHER_ABI, ctx.ethers.provider);
+  const [pool, positionId] = (await Promise.all([launcher.POOL(), launcher.POSITION_ID()]).catch(() => [undefined, undefined])) as [
+    string | undefined,
+    bigint | undefined,
+  ];
   // Prouvé par l'état de la chaîne sans reçu visible : on retente une fois de lire le reçu.
   const finalReceipt = receipt ?? (await findReceipt(ctx, entry).catch(() => null));
   const confirmed: TokenRecord = {
@@ -547,14 +565,15 @@ export async function deployTokenStep(ctx: StepContext, params: LaunchParams): P
     // Le hash de la version réellement minée (une version re-signée peut ne jamais l'avoir été).
     txHash: finalReceipt?.hash ?? entry.txHash,
     blockNumber: finalReceipt?.blockNumber ?? entry.blockNumber,
-    ...(pair === undefined ? {} : { pair: getAddress(pair) }),
+    ...(pool === undefined ? {} : { pool: getAddress(pool) }),
+    ...(positionId === undefined ? {} : { positionId: positionId.toString() }),
     confirmedAt: now(),
   };
   await save(confirmed);
   return confirmed;
 }
 
-// --- Étape 1a : le contrat de blocage de ta part, déployé AVANT la courbe -------------
+// --- Étape 1a : le contrat de blocage de ta part, déployé AVANT le lanceur ------------
 
 export interface VestingPlan {
   beneficiary: string;

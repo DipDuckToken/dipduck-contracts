@@ -12,57 +12,59 @@ export const launchConfig = {
     symbol: "DIPDUCK",
     // Offre totale en tokens entiers ; le contrat ajoute les 18 décimales.
     // 1 milliard est le standard des memecoins. L'offre ne change pas la
-    // capitalisation de départ (fixée par curve.virtualEth), seulement le prix par token.
-    // Maximum : 5 192 296 858 534 827 (taille des réserves Uniswap v2, tient aussi en u128).
+    // capitalisation de départ (fixée par pool.startMarketCapEth), seulement le prix par token.
+    // Maximum : 5 192 296 858 534 827 (tient dans un uint112, donc aussi en u128).
     supply: 1_000_000_000n,
   },
-  curve: {
-    // Courbe de lancement (LaunchCurve, à la pump.fun) : tu n'apportes AUCUN ETH.
-    // La courbe vend les tokens à prix croissant ; quand elle a réuni targetEth, elle ouvre
-    // TOUTE SEULE le pool Uniswap v2 avec cet ETH et le reste de sa part, au prix de fin de
-    // courbe, et brûle les parts LP. Rien n'est modifiable après le déploiement.
+  pool: {
+    // Lancement Uniswap v3 « d'un seul côté » (LaunchPool) : tu n'apportes AUCUN ETH.
+    // Au déploiement, tout ce qui n'est ni ta part ni la réserve (≈ 87 % de l'offre) est placé
+    // dans un pool Uniswap v3 TOKEN/WETH à 1 % de frais, à partir d'un prix de départ et
+    // jusqu'à l'infini. Chaque achat fait monter le prix, l'ETH des acheteurs reste dans le
+    // pool, et chacun peut revendre à tout moment. La liquidité est verrouillée à vie (le
+    // lanceur n'a aucune fonction pour la retirer). Le pool est visible et échangeable sur
+    // Uniswap, DEXTools et GeckoTerminal dès l'ouverture. Rien n'est modifiable ensuite.
     //
-    // Part de l'offre confiée à la courbe (vendue + pool), 1 à 100. Le reste est partagé
-    // entre la réserve communauté (ci-dessous) et ta part : ta part = 100 − tokenPercent − community.percent.
-    // 87 avec une réserve de 3 % = tu gardes 10 %. La courbe garde 100 % de l'offre jusqu'à
-    // l'ouverture du pool, puis verse ta part au contrat de blocage et la réserve au Safe.
-    tokenPercent: 87,
-    // Réserve d'ETH VIRTUELLE (personne ne la paie) : elle fixe le prix de départ.
-    // 4 ETH ≈ capitalisation de départ de 3,1 ETH : 0,5 % de l'offre coûte ≈ 0,016 ETH
-    // (au lieu de 0,0006 ETH avec un pool de 0,1 ETH), soit ≈ 25 fois plus cher pour un robot.
-    virtualEth: "4",
-    // ETH à réunir pour ouvrir le pool Uniswap (il y va en entier, avec ≈ 31,6 % de l'offre).
-    // 3 ETH : ≈ 55,4 % de l'offre vendus sur la courbe, prix × 3,06 entre le début et la fin,
-    // capitalisation ≈ 9,5 ETH à l'ouverture du pool.
-    targetEth: "3",
-    // Heure d'ouverture des achats, date ISO en UTC (ex. "2026-12-01T20:00:00Z"), entre le
+    // Capitalisation de départ voulue, en ETH : elle fixe le prix de départ (capitalisation
+    // ÷ offre). Le script arrondit au palier Uniswap inférieur (au plus 2 % sous la cible)
+    // et affiche le prix et la capitalisation réels. 3 ETH ⇒ 0,5 % de l'offre (la limite de
+    // la 1re heure) coûte ≈ 0,015 ETH, plus 1 % de frais : un robot paie dès la première
+    // seconde un vrai prix.
+    // Les frais d'échange (1 % de chaque achat et revente dans la position) reviennent au
+    // Safe communauté (community.beneficiary) : n'importe qui peut les y envoyer avec
+    // npm run fees:mainnet.
+    startMarketCapEth: "3",
+    // Heure d'ouverture des échanges, date ISO en UTC (ex. "2026-12-01T20:00:00Z"), entre le
     // déploiement et 30 jours après (au moins 1 h après sur le mainnet) : laisse le temps de
-    // vérifier les contrats et d'annoncer l'heure. C'est aussi le début du calendrier du blocage.
-    // Obligatoire sur le mainnet.
+    // vérifier les contrats et d'annoncer l'heure. Avant, personne ne peut acheter. C'est aussi
+    // le début du calendrier du blocage. Obligatoire sur le mainnet.
     openAt: "",
   },
   community: {
     // Réserve communauté (concours de mèmes, récompenses), en % de l'offre (0 à 99).
-    // Gardée par la courbe, puis versée au Safe ci-dessous à l'ouverture du pool (rien si la
-    // cible n'est jamais atteinte) : tout le monde voit son solde. 0 = pas de réserve.
+    // Versée au Safe ci-dessous au déploiement (elle ne peut pas bouger avant l'ouverture) :
+    // tout le monde voit son solde. 0 = pas de réserve.
     percent: 3,
     // Safe 2 sur 3 dédié à la communauté (app.safe.global, réseau Robinhood Chain) :
     // 3 propriétaires (ex. ton Ledger, un 2e wallet, une personne de confiance), 2 signatures
     // pour chaque envoi. Le wallet de déploiement ne doit PAS en être propriétaire.
-    // Le Safe doit EXISTER avant npm run deploy:mainnet : le script refuse de déployer si cette
-    // adresse n'est pas un vrai Safe (son adresse est gravée dans la courbe). Obligatoire si percent > 0. Colle-la avec ses majuscules et minuscules d'origine.
+    // Il reçoit aussi les frais d'échange du pool. Le Safe doit EXISTER avant npm run deploy:mainnet :
+    // le script refuse de déployer si cette adresse n'est pas un vrai Safe (elle est gravée dans
+    // le lanceur). Obligatoire. Colle-la avec ses majuscules et minuscules d'origine.
     beneficiary: "",
   },
   vesting: {
-    // Ta part va dans un contrat de vesting déployé par npm run deploy:mainnet juste AVANT la
-    // courbe ; la courbe le remplit à l'ouverture du pool (rien si la cible n'est jamais
-    // atteinte). Ton wallet ne détient jamais ces tokens. Le calendrier commence à curve.openAt :
-    // rien n'est libérable avant la falaise, puis la libération est linéaire jusqu'à la fin.
-    // Personne ne peut retirer plus tôt, pas même toi. Doit rester true si tu gardes une part.
+    // Ta part va dans un contrat de vesting déployé par npm run deploy:mainnet juste AVANT le
+    // lanceur, qui le remplit au déploiement. Ton wallet ne détient jamais ces tokens. Le
+    // calendrier commence à pool.openAt : rien n'est libérable avant la falaise, puis la
+    // libération est linéaire jusqu'à la fin. Personne ne peut retirer plus tôt, pas même toi.
+    // Doit rester true si tu gardes une part.
     enabled: true,
+    // Ta part, en % de l'offre (0 à 99). 10 avec une réserve de 3 % = ≈ 87 % dans le pool.
+    percent: 10,
     // Durée totale du blocage, en jours (365 = un an).
     durationDays: 900,
-    // Falaise : rien n'est libérable avant ce délai après curve.openAt, en jours (1 à durationDays).
+    // Falaise : rien n'est libérable avant ce délai après pool.openAt, en jours (1 à durationDays).
     // À la falaise, la part correspondant au temps écoulé devient libérable d'un coup
     // (90 jours sur 900 = 10 % exactement), puis le reste se libère chaque seconde jusqu'à la fin.
     cliffDays: 90,

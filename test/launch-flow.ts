@@ -1,12 +1,12 @@
 import { expect } from "chai";
-import { Contract, MaxUint256, ZeroAddress, getCreateAddress, parseEther, parseUnits } from "ethers";
+import { Contract, MaxUint256, ZeroAddress, getCreateAddress, parseUnits, zeroPadValue } from "ethers";
 import { network } from "hardhat";
 import type { NetworkConnection } from "hardhat/types/network";
 
-import { DEAD_ADDRESS, UNISWAP_V2_MINIMUM_LIQUIDITY, UNIT } from "../scripts/lib/constants.ts";
-import { CURVE_ABI, buildCurvePlan, readCurveStatus, splitSupply } from "../scripts/lib/curve.ts";
+import { UNIT } from "../scripts/lib/constants.ts";
+import { LAUNCHER_ABI, buildLaunchPlan, readLaunchStatus, splitSupply, startTickFor } from "../scripts/lib/launch.ts";
 import { LaunchError } from "../scripts/lib/errors.ts";
-import type { UniswapV2Deployment } from "../scripts/lib/networks.ts";
+import type { UniswapV3Deployment } from "../scripts/lib/networks.ts";
 import { type Journal, type TokenRecord, memoryJournal } from "../scripts/lib/records.ts";
 import { runRehearsal } from "../scripts/lib/rehearsal.ts";
 import {
@@ -17,13 +17,19 @@ import {
   deployVestingStep,
   launchParamsOf,
 } from "../scripts/lib/steps.ts";
-import { CURVE_CONTRACT, VESTING_CONTRACT, curveConstructorArgs, vestingConstructorArgs } from "../scripts/lib/token.ts";
+import {
+  LAUNCHER_CONTRACT,
+  VESTING_CONTRACT,
+  launcherConstructorArgs,
+  predictTokenAddress,
+  vestingConstructorArgs,
+} from "../scripts/lib/token.ts";
 import { type TxPayload, broadcastRaw, nextNonce, signTx } from "../scripts/lib/tx.ts";
-import { ERC20_ABI, PAIR_ABI, ROUTER_ABI, assertUniswapV2Deployment, readPoolStatus } from "../scripts/lib/uniswap.ts";
+import { ERC20_ABI, V3_POSITION_MANAGER_ABI, assertUniswapV3Deployment, swapperFor } from "../scripts/lib/uniswap.ts";
 import type { TokenParams } from "../scripts/lib/validation.ts";
 import { VESTING_ABI, readVestingStatus } from "../scripts/lib/vesting.ts";
 import { localWallet } from "../scripts/lib/wallet.ts";
-import { deployLocalUniswapV2 } from "./helpers/uniswap-local.ts";
+import { deployLocalUniswapV3 } from "./helpers/uniswap-v3-local.ts";
 
 const connection = await network.create();
 const { ethers, networkHelpers } = connection;
@@ -31,8 +37,7 @@ const { chainId } = await ethers.provider.getNetwork();
 
 const TOKEN: TokenParams = { name: "Test Token", symbol: "TEST", supply: 1_000_000_000n };
 const SUPPLY = TOKEN.supply * UNIT;
-const VIRTUAL = parseEther("2");
-const TARGET = parseEther("3");
+const START_TICK = startTickFor(3n * UNIT, TOKEN.supply);
 const HOUR = 3_600n;
 const DAY = 86_400n;
 
@@ -118,33 +123,33 @@ async function deployFakeSafe(conn: NetworkConnection): Promise<string> {
   return await safe.getAddress();
 }
 
-/** Paramètres de la courbe : par défaut 100 % de l'offre sur la courbe, ni part ni réserve. */
+/** Paramètres du lanceur : par défaut tout dans le pool, frais au Safe, ni part ni réserve. */
 function launchParams(
-  uniswap: UniswapV2Deployment,
+  uniswap: UniswapV3Deployment,
+  safe: string,
   openAt: bigint,
-  share?: { vesting?: string; community?: string; tokenPercent?: bigint; communityPercent?: bigint },
+  share?: { vesting?: string; vestingPercent?: bigint; communityPercent?: bigint; salt?: string },
 ): LaunchParams {
-  const tokenPercent = share?.tokenPercent ?? 100n;
-  const split = splitSupply(TOKEN.supply, tokenPercent, share?.communityPercent ?? 0n);
+  const split = splitSupply(TOKEN.supply, share?.vestingPercent ?? 0n, share?.communityPercent ?? 0n);
   return {
     ...TOKEN,
+    positionManager: uniswap.positionManager,
     factory: uniswap.factory,
     weth: uniswap.weth,
-    curveTokenPercent: tokenPercent,
-    curveWholeTokens: split.curveWholeTokens,
-    virtualEthWei: VIRTUAL,
-    targetEthWei: TARGET,
+    startTick: START_TICK,
     openAt,
     vesting: share?.vesting ?? ZeroAddress,
     vestingWholeTokens: split.vestingWholeTokens,
-    community: share?.community ?? ZeroAddress,
+    community: split.communityWholeTokens > 0n ? safe : ZeroAddress,
     communityWholeTokens: split.communityWholeTokens,
+    feeRecipient: safe,
+    salt: share?.salt,
   };
 }
 
 async function setupFixture() {
   const [deployer, buyer, attacker, operator] = await ethers.getSigners();
-  const uniswap = await deployLocalUniswapV2(ethers, operator);
+  const uniswap = await deployLocalUniswapV3(ethers, operator);
   const safe = await deployFakeSafe(connection);
   const wallet = await localWallet(connection);
   expect(wallet.address).to.equal(deployer.address);
@@ -156,151 +161,119 @@ async function setup() {
   return { ...fixture, openAt: (await latest()) + 2n * HOUR };
 }
 
-/** Achète jusqu'à la cible (après les 24 h de limite) : le pool s'ouvre. */
-async function graduate(curve: string, conn: NetworkConnection = connection): Promise<void> {
-  const status = await readCurveStatus(conn.ethers.provider, curve);
-  const now = await latest(conn);
-  if (now < status.openAt + DAY) await conn.networkHelpers.time.increaseTo(status.openAt + DAY);
-  const whale = (await conn.ethers.getSigners())[8];
-  const asWhale = new Contract(curve, CURVE_ABI, whale);
-  await (await asWhale.buy(0n, (await latest(conn)) + 600n, { value: status.targetEth - status.ethReserve })).wait();
-}
-
-describe("Adresses Uniswap", function () {
+describe("Adresses Uniswap v3", function () {
   it("accepte un déploiement cohérent et refuse une incohérence ou une adresse vide", async function () {
     const { uniswap, buyer } = await setup();
-    await assertUniswapV2Deployment(ethers.provider, uniswap);
-    await expectLaunchError(assertUniswapV2Deployment(ethers.provider, { ...uniswap, weth: uniswap.factory }), /annonce le WETH/);
-    await expectLaunchError(assertUniswapV2Deployment(ethers.provider, { ...uniswap, factory: uniswap.weth }), /annonce la factory/);
-    await expectLaunchError(assertUniswapV2Deployment(ethers.provider, { ...uniswap, router: buyer.address }), /Aucun contrat/);
+    await assertUniswapV3Deployment(ethers.provider, uniswap);
+    await expectLaunchError(assertUniswapV3Deployment(ethers.provider, { ...uniswap, weth: uniswap.factory }), /annonce le WETH/);
+    await expectLaunchError(assertUniswapV3Deployment(ethers.provider, { ...uniswap, factory: uniswap.weth }), /annonce la factory/);
+    await expectLaunchError(assertUniswapV3Deployment(ethers.provider, { ...uniswap, swapRouter: buyer.address }), /Aucun contrat/);
   });
 });
 
-describe("Déploiement de la courbe (vrai bytecode Uniswap v2)", function () {
-  it("déploie la courbe, qui crée le token et garde 100 % de l'offre ; adresses prévues avant diffusion", async function () {
-    const { wallet, uniswap, openAt } = await setup();
+describe("Déploiement du lanceur (vrai bytecode Uniswap v3)", function () {
+  it("crée le token, le pool et la position d'un seul côté ; adresses prévues avant diffusion", async function () {
+    const { wallet, uniswap, safe, openAt } = await setup();
     const ctx = contextFor(connection, wallet);
     const nonce = await ethers.provider.getTransactionCount(wallet.address);
-    const token = await deployTokenStep(ctx, launchParams(uniswap, openAt));
+    const token = await deployTokenStep(ctx, launchParams(uniswap, safe, openAt));
 
-    const curveAddress = getCreateAddress({ from: wallet.address, nonce });
+    const launcherAddress = getCreateAddress({ from: wallet.address, nonce });
     expect(token.status).to.equal("confirmed");
-    expect(token.curve).to.equal(curveAddress);
-    expect(token.address).to.equal(getCreateAddress({ from: curveAddress, nonce: 1 }));
-    expect(token.openAt).to.equal(openAt.toString());
-    expect(await balanceOf(token.address, token.curve)).to.equal(SUPPLY);
-    expect(await balanceOf(token.address, wallet.address)).to.equal(0n);
+    expect(token.launcher).to.equal(launcherAddress);
+    expect(token.salt).to.match(/^0x[0-9a-f]{64}$/);
+    expect(token.address).to.equal(await predictTokenAddress(ethers, launcherAddress, token));
     expect(await ethers.provider.getTransactionCount(wallet.address)).to.equal(nonce + 1);
+    expect(await balanceOf(token.address, wallet.address)).to.equal(0n);
 
-    const status = await readCurveStatus(ethers.provider, token.curve);
+    const status = await readLaunchStatus(ethers.provider, token.launcher);
     expect(status.token).to.equal(token.address);
-    expect(status.pair).to.equal(token.pair);
-    expect(status.graduated).to.equal(false);
-    expect(status.walletLimit).to.equal(0n); // achats pas encore ouverts
+    expect(status.pool).to.equal(token.pool);
+    expect(status.positionId.toString()).to.equal(token.positionId);
+    expect(status.feeRecipient).to.equal(safe);
+    expect(status.state.tokenBalance).to.equal(status.poolTokens);
+    expect(status.state.wethBalance).to.equal(0n);
+    expect(status.walletLimit).to.equal(MaxUint256); // pas de limite avant l'heure (et aucun achat possible)
+    const npm = new Contract(uniswap.positionManager, V3_POSITION_MANAGER_ABI, ethers.provider);
+    expect(await npm.ownerOf(status.positionId)).to.equal(token.launcher);
 
-    // Les chiffres affichés par le script sont ceux du contrat.
-    const plan = buildCurvePlan({
-      supplyWholeTokens: TOKEN.supply,
-      split: splitSupply(TOKEN.supply, 100n, 0n),
-      virtualEthWei: VIRTUAL,
-      targetEthWei: TARGET,
-    });
-    expect(status.virtualTokens).to.equal(plan.virtualTokens);
-    expect(status.curveTokens).to.equal(plan.soldTokens);
-    expect(status.lpTokens).to.equal(plan.lpTokens);
-    expect(status.price).to.equal(plan.startPriceWei);
+    // Le prix affiché par le plan est celui du pool (à l'arrondi d'affichage près).
+    const plan = buildLaunchPlan({ supplyWholeTokens: TOKEN.supply, split: splitSupply(TOKEN.supply, 0n, 0n), startTick: START_TICK });
+    const gap = plan.startPriceWei > status.state.priceWei ? plan.startPriceWei - status.state.priceWei : status.state.priceWei - plan.startPriceWei;
+    expect(gap * 1_000_000n <= plan.startPriceWei).to.equal(true);
 
-    await expectLaunchError(deployTokenStep(ctx, launchParams(uniswap, openAt)), /déjà déployé/);
+    await expectLaunchError(deployTokenStep(ctx, launchParams(uniswap, safe, openAt)), /déjà déployé/);
     expect(await ethers.provider.getTransactionCount(wallet.address)).to.equal(nonce + 1);
   });
 
   it("refuse une heure d'ouverture passée, imminente ou à plus de 30 jours, sans rien envoyer", async function () {
-    const { wallet, uniswap } = await setup();
+    const { wallet, uniswap, safe } = await setup();
     const ctx = contextFor(connection, wallet);
     const nonce = await ethers.provider.getTransactionCount(wallet.address);
     const now = await latest();
-    await expectLaunchError(deployTokenStep(ctx, launchParams(uniswap, now - 10n)), /passée ou imminente/);
-    await expectLaunchError(deployTokenStep(ctx, launchParams(uniswap, now + 30n)), /passée ou imminente/);
-    await expectLaunchError(deployTokenStep(ctx, launchParams(uniswap, now + 31n * DAY)), /plus de 30 jours/);
+    await expectLaunchError(deployTokenStep(ctx, launchParams(uniswap, safe, now - 10n)), /passée ou imminente/);
+    await expectLaunchError(deployTokenStep(ctx, launchParams(uniswap, safe, now + 30n)), /passée ou imminente/);
+    await expectLaunchError(deployTokenStep(ctx, launchParams(uniswap, safe, now + 31n * DAY)), /plus de 30 jours/);
     expect(await ctx.journal.read()).to.equal(undefined);
     expect(await ethers.provider.getTransactionCount(wallet.address)).to.equal(nonce);
   });
 
-  it("refuse, par simulation et sans rien envoyer, un contrat de blocage ou un Safe sans code", async function () {
-    const { wallet, buyer, uniswap, openAt } = await setup();
+  it("refuse, par simulation et sans rien envoyer, un contrat de blocage sans code ou un tick invalide", async function () {
+    const { wallet, buyer, uniswap, safe, openAt } = await setup();
     const ctx = contextFor(connection, wallet);
     const nonce = await ethers.provider.getTransactionCount(wallet.address);
     await expectLaunchError(
-      deployTokenStep(ctx, launchParams(uniswap, openAt, { vesting: buyer.address, tokenPercent: 90n })),
+      deployTokenStep(ctx, launchParams(uniswap, safe, openAt, { vesting: buyer.address, vestingPercent: 10n })),
       /simulation.*refuse ses paramètres/,
     );
-    await expectLaunchError(
-      deployTokenStep(ctx, launchParams(uniswap, openAt, { community: buyer.address, tokenPercent: 97n, communityPercent: 3n })),
-      /simulation/,
-    );
+    await expectLaunchError(deployTokenStep(ctx, { ...launchParams(uniswap, safe, openAt), startTick: START_TICK + 1 }), /simulation/);
     expect(await ctx.journal.read()).to.equal(undefined);
     expect(await ethers.provider.getTransactionCount(wallet.address)).to.equal(nonce);
   });
 
-  it("le pool s'ouvre tout seul à la cible, au prix de fin de courbe, LP toutes brûlées", async function () {
-    const { wallet, uniswap, openAt } = await setup();
-    const token = await deployTokenStep(contextFor(connection, wallet), launchParams(uniswap, openAt));
-    await graduate(token.curve);
-
-    const status = await readCurveStatus(ethers.provider, token.curve);
-    expect(status.graduated).to.equal(true);
-    const pool = await readPoolStatus(ethers.provider, uniswap, token.address, wallet.address);
-    expect(pool?.pair).to.equal(token.pair);
-    expect(pool?.wethReserve).to.equal(TARGET);
-    expect(pool?.tokenReserve).to.equal(status.lpTokens);
-    expect(pool?.lpHeldBy).to.equal(0n);
-    const lp = new Contract(token.pair as string, PAIR_ABI, ethers.provider);
-    expect(await lp.balanceOf(DEAD_ADDRESS)).to.equal(((await lp.totalSupply()) as bigint) - UNISWAP_V2_MINIMUM_LIQUIDITY);
-    expect(await balanceOf(token.address, token.curve)).to.equal(0n);
-    expect(await ethers.provider.getBalance(token.curve)).to.equal(0n);
-  });
-
-  it("répétition complète, sans part ni réserve : courbe, achats, revente, cible, achat Uniswap", async function () {
-    const { uniswap, openAt } = await setup();
+  it("répétition complète sans part ni réserve : achats, revente, 24 h, frais au Safe", async function () {
+    const { uniswap, safe, openAt } = await setup();
     const report = await runRehearsal(connection, uniswap, {
       token: TOKEN,
-      curve: { tokenPercent: 100n, curveWholeTokens: TOKEN.supply, virtualEthWei: VIRTUAL, targetEthWei: TARGET, openAt },
+      pool: { startMarketCapWei: 3n * UNIT, startTick: START_TICK, openAt },
+      vestingPercent: 0n,
+      community: { percent: 0n, beneficiary: safe },
     });
     expect(report.antiBot.buyBeforeOpenBlocked).to.equal(true);
     expect(report.antiBot.bigBuyBlocked).to.equal(true);
     expect(report.antiBot.limitAtOpen).to.equal(SUPPLY / 200n);
-    expect(report.antiBot.poolBigBuyBlocked).to.equal(true);
-    expect(report.graduation.ethInPool).to.equal(TARGET);
-    expect(report.graduation.refunded).to.be.greaterThan(0n);
-    expect(report.pool.lpHeldBy).to.equal(0n);
-    expect(report.routerBuy.tokensOut).to.be.greaterThan(0n);
+    expect(report.distribution.deployer).to.equal(0n);
+    expect(report.fees.weth).to.be.greaterThan(0n);
     expect(report.resale.ethOut).to.be.greaterThan(0n);
+    expect(report.status.state.wethBalance).to.be.greaterThan(0n);
   });
 });
 
 describe("Reprise après interruption : jamais de double envoi", function () {
+  const SALT = zeroPadValue("0x01", 32);
+
   /** Simule un arrêt juste après la signature : la transaction est notée, pas forcément diffusée. */
   async function signedTokenEntry(ctx: StepContext, params: LaunchParams): Promise<TokenRecord> {
-    const factory = await ethers.getContractFactory(CURVE_CONTRACT);
+    const factory = await ethers.getContractFactory(LAUNCHER_CONTRACT);
     const nonce = await nextNonce(ethers.provider, ctx.wallet.address);
-    const curve = getCreateAddress({ from: ctx.wallet.address, nonce });
+    const launcher = getCreateAddress({ from: ctx.wallet.address, nonce });
     const fields = {
       name: params.name,
       symbol: params.symbol,
       supplyWholeTokens: params.supply.toString(),
+      positionManager: params.positionManager,
       factory: params.factory,
       weth: params.weth,
-      curveTokenPercent: Number(params.curveTokenPercent),
-      curveWholeTokens: params.curveWholeTokens.toString(),
+      salt: params.salt ?? SALT,
       vesting: params.vesting,
       vestingWholeTokens: params.vestingWholeTokens.toString(),
       community: params.community,
       communityWholeTokens: params.communityWholeTokens.toString(),
-      virtualEthWei: params.virtualEthWei.toString(),
-      targetEthWei: params.targetEthWei.toString(),
+      feeRecipient: params.feeRecipient,
+      startTick: params.startTick,
       openAt: params.openAt.toString(),
     };
-    const payload: TxPayload = { data: (await factory.getDeployTransaction(...curveConstructorArgs(fields))).data };
+    const payload: TxPayload = { data: (await factory.getDeployTransaction(...launcherConstructorArgs(fields))).data };
     const signed = await signTx(ethers.provider, ctx.wallet, chainId, payload, nonce);
     const entry: TokenRecord = {
       status: "pending",
@@ -309,8 +282,8 @@ describe("Reprise après interruption : jamais de double envoi", function () {
       txHash: signed.hash,
       rawTx: signed.raw,
       preparedAt: new Date().toISOString(),
-      address: getCreateAddress({ from: curve, nonce: 1 }),
-      curve,
+      address: await predictTokenAddress(ethers, launcher, fields),
+      launcher,
       ...fields,
     };
     const record = await ctx.journal.read();
@@ -318,24 +291,25 @@ describe("Reprise après interruption : jamais de double envoi", function () {
     return entry;
   }
 
-  it("signée et notée mais jamais diffusée : diffuse exactement la même transaction", async function () {
-    const { wallet, uniswap, openAt } = await setup();
+  it("signée et notée mais jamais diffusée : diffuse exactement la même transaction (même sel)", async function () {
+    const { wallet, uniswap, safe, openAt } = await setup();
     const ctx = contextFor(connection, wallet);
-    const entry = await signedTokenEntry(ctx, launchParams(uniswap, openAt));
+    const entry = await signedTokenEntry(ctx, launchParams(uniswap, safe, openAt));
 
     // D'autres paramètres dans l'appel : la reprise suit le journal.
-    const token = await deployTokenStep(ctx, launchParams(uniswap, openAt + DAY));
+    const token = await deployTokenStep(ctx, launchParams(uniswap, safe, openAt + DAY));
     expect(token.status).to.equal("confirmed");
     expect(token.txHash).to.equal(entry.txHash);
     expect(token.address).to.equal(entry.address);
+    expect(token.salt).to.equal(SALT);
     expect(token.openAt).to.equal(openAt.toString());
     expect(await ethers.provider.getTransactionCount(wallet.address)).to.equal(entry.nonce + 1);
   });
 
   it("diffusée mais réponse perdue : retrouve le reçu par son hash, sans rediffuser ni redéployer", async function () {
-    const { wallet, uniswap, openAt } = await setup();
+    const { wallet, uniswap, safe, openAt } = await setup();
     const ctx = contextFor(connection, wallet);
-    const entry = await signedTokenEntry(ctx, launchParams(uniswap, openAt));
+    const entry = await signedTokenEntry(ctx, launchParams(uniswap, safe, openAt));
     await broadcastRaw(ethers.provider, entry.rawTx);
 
     const token = await deployTokenStep(ctx, launchParamsOf(entry));
@@ -346,9 +320,9 @@ describe("Reprise après interruption : jamais de double envoi", function () {
   });
 
   it("encore en attente sur le réseau : s'arrête sans rien changer, puis confirme", async function () {
-    const { wallet, uniswap, openAt } = await setup();
+    const { wallet, uniswap, safe, openAt } = await setup();
     const ctx = contextFor(connection, wallet);
-    const entry = await signedTokenEntry(ctx, launchParams(uniswap, openAt));
+    const entry = await signedTokenEntry(ctx, launchParams(uniswap, safe, openAt));
 
     await ethers.provider.send("evm_setAutomine", [false]);
     try {
@@ -366,21 +340,21 @@ describe("Reprise après interruption : jamais de double envoi", function () {
   });
 
   it("nonce pris par une autre transaction : s'arrête sans rien effacer ni renvoyer", async function () {
-    const { wallet, buyer, uniswap, openAt } = await setup();
+    const { wallet, buyer, uniswap, safe, openAt } = await setup();
     const ctx = contextFor(connection, wallet);
-    const entry = await signedTokenEntry(ctx, launchParams(uniswap, openAt));
+    const entry = await signedTokenEntry(ctx, launchParams(uniswap, safe, openAt));
     const other = await signTx(ethers.provider, wallet, chainId, { to: buyer.address, data: "0x", value: 1n }, entry.nonce);
     await broadcastRaw(ethers.provider, other.raw);
 
     await expectLaunchError(deployTokenStep(ctx, launchParamsOf(entry)), /déjà utilisé/);
     expect((await ctx.journal.read())?.token?.txHash).to.equal(entry.txHash);
-    expect(await ethers.provider.getCode(entry.curve)).to.equal("0x");
+    expect(await ethers.provider.getCode(entry.launcher)).to.equal("0x");
   });
 
-  it("frais devenus trop bas : re-signe avec le même nonce, une seule courbe", async function () {
-    const { wallet, uniswap, openAt } = await setup();
+  it("frais devenus trop bas : re-signe avec le même nonce et le même sel, un seul lanceur", async function () {
+    const { wallet, uniswap, safe, openAt } = await setup();
     const ctx = contextFor(connection, wallet);
-    const entry = await signedTokenEntry(ctx, launchParams(uniswap, openAt));
+    const entry = await signedTokenEntry(ctx, launchParams(uniswap, safe, openAt));
     await networkHelpers.setNextBlockBaseFeePerGas(parseUnits("1000", "gwei"));
     await networkHelpers.mine();
 
@@ -388,21 +362,21 @@ describe("Reprise après interruption : jamais de double envoi", function () {
     expect(token.status).to.equal("confirmed");
     expect(token.txHash).to.not.equal(entry.txHash);
     expect(token.replacedTxHashes).to.deep.equal([entry.txHash]);
-    expect(token.curve).to.equal(entry.curve);
+    expect(token.launcher).to.equal(entry.launcher);
     expect(token.address).to.equal(entry.address);
     expect(await ethers.provider.getTransactionCount(wallet.address)).to.equal(entry.nonce + 1);
   });
 
   it("version précédente minée après une re-signature : le journal garde le hash réellement miné", async function () {
-    const { wallet, uniswap, openAt } = await setup();
+    const { wallet, uniswap, safe, openAt } = await setup();
     const ctx = contextFor(connection, wallet);
-    const mined = await signedTokenEntry(ctx, launchParams(uniswap, openAt));
+    const mined = await signedTokenEntry(ctx, launchParams(uniswap, safe, openAt));
     await broadcastRaw(ethers.provider, mined.rawTx);
     await networkHelpers.setNextBlockBaseFeePerGas(parseUnits("5", "gwei"));
     await networkHelpers.mine();
     // Une version re-signée (même nonce) notée comme courante, mais jamais diffusée.
-    const factory = await ethers.getContractFactory(CURVE_CONTRACT);
-    const payload = { data: (await factory.getDeployTransaction(...curveConstructorArgs(mined))).data };
+    const factory = await ethers.getContractFactory(LAUNCHER_CONTRACT);
+    const payload = { data: (await factory.getDeployTransaction(...launcherConstructorArgs(mined))).data };
     const other = await signTx(ethers.provider, wallet, chainId, payload, mined.nonce, 10_000_000n);
     expect(other.hash).to.not.equal(mined.txHash);
     await ctx.journal.write({
@@ -417,34 +391,36 @@ describe("Reprise après interruption : jamais de double envoi", function () {
   });
 
   it("réponse perdue à la diffusion alors que la transaction est arrivée : la suit sans re-signer", async function () {
-    const { wallet, uniswap, openAt } = await setup();
+    const { wallet, uniswap, safe, openAt } = await setup();
     const ctx = flakyBroadcastContext(contextFor(connection, wallet), true);
-    const token = await deployTokenStep(ctx, launchParams(uniswap, openAt));
+    const token = await deployTokenStep(ctx, launchParams(uniswap, safe, openAt));
     expect(token.status).to.equal("confirmed");
     expect(token.replacedTxHashes).to.equal(undefined);
     expect(await ethers.provider.getTransactionCount(wallet.address)).to.equal(token.nonce + 1);
   });
 
   it("RPC muet à la diffusion (rien n'est arrivé) : s'arrête, puis la relance diffuse la même transaction", async function () {
-    const { wallet, uniswap, openAt } = await setup();
+    const { wallet, uniswap, safe, openAt } = await setup();
     const journal = memoryJournal();
     await expectLaunchError(
-      deployTokenStep(flakyBroadcastContext(contextFor(connection, wallet, journal), false), launchParams(uniswap, openAt)),
+      deployTokenStep(flakyBroadcastContext(contextFor(connection, wallet, journal), false), launchParams(uniswap, safe, openAt)),
       /impossible pour l'instant/,
     );
     const pending = (await journal.read())?.token;
     expect(pending?.status).to.equal("pending");
     expect(await ethers.provider.getTransactionCount(wallet.address)).to.equal(pending?.nonce);
 
-    const token = await deployTokenStep(contextFor(connection, wallet, journal), launchParams(uniswap, openAt));
+    // Nouveau sel dans l'appel : ignoré, la relance diffuse la transaction notée.
+    const token = await deployTokenStep(contextFor(connection, wallet, journal), launchParams(uniswap, safe, openAt));
     expect(token.txHash).to.equal(pending?.txHash);
+    expect(token.salt).to.equal(pending?.salt);
     expect(token.status).to.equal("confirmed");
   });
 
   it("solde insuffisant au moment de diffuser : s'arrête sans re-signer, puis diffuse la même transaction", async function () {
-    const { wallet, uniswap, openAt } = await setup();
+    const { wallet, uniswap, safe, openAt } = await setup();
     const ctx = contextFor(connection, wallet);
-    const entry = await signedTokenEntry(ctx, launchParams(uniswap, openAt));
+    const entry = await signedTokenEntry(ctx, launchParams(uniswap, safe, openAt));
     const funds = await ethers.provider.getBalance(wallet.address);
     await networkHelpers.setBalance(wallet.address, 1n);
 
@@ -459,8 +435,8 @@ describe("Reprise après interruption : jamais de double envoi", function () {
     expect(token.status).to.equal("confirmed");
   });
 
-  it("RPC en retard sur le nonce : le blocage puis la courbe prennent quand même les bons nonces", async function () {
-    const { wallet, uniswap, openAt } = await setup();
+  it("RPC en retard sur le nonce : le blocage puis le lanceur prennent les bons nonces, adresse du token juste", async function () {
+    const { wallet, uniswap, safe, openAt } = await setup();
     const ctx = contextFor(connection, wallet);
     const first = await ethers.provider.getTransactionCount(wallet.address);
     const vesting = await deployVestingStep(ctx, {
@@ -472,15 +448,16 @@ describe("Reprise après interruption : jamais de double envoi", function () {
     // Le nœud qui répond annonce encore l'ancien compte : le journal sait que le nonce est pris.
     const token = await deployTokenStep(
       laggingContext(ctx, 1),
-      launchParams(uniswap, openAt, { vesting: vesting.address, tokenPercent: 90n }),
+      launchParams(uniswap, safe, openAt, { vesting: vesting.address, vestingPercent: 10n }),
     );
     expect(vesting.nonce).to.equal(first);
     expect(token.nonce).to.equal(first + 1);
     expect(token.status).to.equal("confirmed");
+    expect(await balanceOf(token.address, vesting.address)).to.equal(SUPPLY / 10n);
   });
 });
 
-describe("Ta part et la réserve : contrat de blocage et Safe avant la courbe, versés à l'ouverture du pool", function () {
+describe("Ta part et la réserve : blocage et Safe avant le lanceur, servis au déploiement", function () {
   const TEAM = (SUPPLY * 10n) / 100n;
   const RESERVE = (SUPPLY * 3n) / 100n;
 
@@ -496,50 +473,30 @@ describe("Ta part et la réserve : contrat de blocage et Safe avant la courbe, v
     const vesting = await deployVestingStep(ctx, plan);
     const token = await deployTokenStep(
       ctx,
-      launchParams(fixture.uniswap, fixture.openAt, {
-        vesting: vesting.address,
-        community: fixture.safe,
-        tokenPercent: 87n,
-        communityPercent: 3n,
-      }),
+      launchParams(fixture.uniswap, fixture.safe, fixture.openAt, { vesting: vesting.address, vestingPercent: 10n, communityPercent: 3n }),
     );
     return { ...fixture, ctx, plan, vesting, token };
   }
 
-  it("le blocage est déployé AVANT la courbe ; tout reste dans la courbe jusqu'à la cible", async function () {
+  it("le blocage est déployé AVANT le lanceur ; part, réserve et pool servis au déploiement, montants exacts", async function () {
     const { wallet, safe, vesting, token } = await launched();
     expect(vesting.nonce).to.be.lessThan(token.nonce);
     expect(token.vesting).to.equal(vesting.address);
-    expect(token.community).to.equal(safe);
     expect(BigInt(token.vestingWholeTokens) * UNIT).to.equal(TEAM);
     expect(BigInt(token.communityWholeTokens) * UNIT).to.equal(RESERVE);
-    // Le wallet de déploiement ne détient jamais de tokens ; part et réserve attendent dans la courbe.
+    // Le wallet de déploiement ne détient jamais de tokens.
     expect(await balanceOf(token.address, wallet.address)).to.equal(0n);
-    expect(await balanceOf(token.address, vesting.address)).to.equal(0n);
-    expect(await balanceOf(token.address, safe)).to.equal(0n);
-    expect(await balanceOf(token.address, token.curve)).to.equal(SUPPLY);
-    const status = await readCurveStatus(ethers.provider, token.curve);
-    expect(status.vesting).to.equal(vesting.address);
-    expect(status.vestingTokens).to.equal(TEAM);
-    expect(status.community).to.equal(safe);
-    expect(status.communityTokens).to.equal(RESERVE);
-  });
-
-  it("à la cible : ta part va au blocage, la réserve au Safe, le reste au pool, montants exacts", async function () {
-    const { wallet, uniswap, safe, vesting, token } = await launched();
-    await graduate(token.curve);
     expect(await balanceOf(token.address, vesting.address)).to.equal(TEAM);
     expect(await balanceOf(token.address, safe)).to.equal(RESERVE);
-    expect(await balanceOf(token.address, wallet.address)).to.equal(0n);
-    const status = await readCurveStatus(ethers.provider, token.curve);
-    const pool = await readPoolStatus(ethers.provider, uniswap, token.address, wallet.address);
-    expect(pool?.tokenReserve).to.equal(status.lpTokens);
-    expect(await balanceOf(token.address, token.curve)).to.equal(0n);
+    const status = await readLaunchStatus(ethers.provider, token.launcher);
+    expect(status.vestingTokens).to.equal(TEAM);
+    expect(status.communityTokens).to.equal(RESERVE);
+    expect(status.state.tokenBalance).to.equal(status.poolTokens);
+    expect(SUPPLY - TEAM - RESERVE - status.poolTokens < 10n ** 9n).to.equal(true); // arrondis brûlés
   });
 
-  it("se libère selon le calendrier (début = ouverture des achats), toujours au bénéficiaire", async function () {
+  it("se libère selon le calendrier (début = ouverture des échanges), toujours au bénéficiaire", async function () {
     const { wallet, buyer, plan, vesting, token } = await launched();
-    await graduate(token.curve);
     const asStranger = new Contract(vesting.address, VESTING_ABI, buyer);
     const status = await readVestingStatus(ethers.provider, vesting.address, token.address);
     expect(status.cliff).to.equal(plan.start + plan.cliffSeconds);
@@ -560,20 +517,6 @@ describe("Ta part et la réserve : contrat de blocage et Safe avant la courbe, v
     await (await asStranger.release(token.address)).wait();
     expect(await balanceOf(token.address, wallet.address)).to.equal(TEAM);
     expect(await balanceOf(token.address, vesting.address)).to.equal(0n);
-  });
-
-  it("cible jamais atteinte : ta part et la réserve restent dans la courbe, personne ne peut les revendre", async function () {
-    const { wallet, buyer, safe, vesting, token } = await launched();
-    await networkHelpers.time.increaseTo(BigInt(token.openAt) + DAY);
-    const asBuyer = new Contract(token.curve, CURVE_ABI, buyer);
-    await (await asBuyer.buy(0n, (await latest()) + 600n, { value: parseEther("0.5") })).wait();
-    await networkHelpers.time.increase(365n * DAY);
-    expect(await balanceOf(token.address, vesting.address)).to.equal(0n);
-    expect(await balanceOf(token.address, safe)).to.equal(0n);
-    expect(await balanceOf(token.address, wallet.address)).to.equal(0n);
-    // Revente plafonnée à ce que la courbe a vendu : part et réserve n'en font pas partie.
-    const status = await readCurveStatus(ethers.provider, token.curve);
-    expect(await balanceOf(token.address, token.curve)).to.equal(SUPPLY - status.tokensSold);
   });
 
   it("le bénéficiaire peut transmettre son rôle : le contrat noté reste reconnu", async function () {
@@ -630,31 +573,22 @@ describe("Ta part et la réserve : contrat de blocage et Safe avant la courbe, v
     expect(await ethers.provider.getTransactionCount(wallet.address)).to.equal(nonce + 1);
   });
 
-  it("répétition complète : blocage puis courbe, Safe d'essai, part et réserve versées à la cible, libération entière", async function () {
+  it("répétition complète : blocage puis lanceur, Safe d'essai, frais au Safe, libération entière", async function () {
     const { uniswap, wallet, openAt } = await setup();
     const report = await runRehearsal(connection, uniswap, {
       token: TOKEN,
-      curve: { tokenPercent: 87n, curveWholeTokens: 870_000_000n, virtualEthWei: VIRTUAL, targetEthWei: TARGET, openAt },
+      pool: { startMarketCapWei: 3n * UNIT, startTick: START_TICK, openAt },
+      vestingPercent: 10n,
       vesting: { enabled: true, durationSeconds: 900n * DAY, cliffSeconds: 90n * DAY, beneficiary: wallet.address },
       community: { percent: 3n, beneficiary: undefined },
     });
-    expect(report.communitySafe?.fakeSafe).to.equal(true);
+    expect(report.communitySafe.fakeSafe).to.equal(true);
     expect(report.vestingRecord?.nonce).to.be.lessThan(report.token.nonce);
-    expect(report.graduation.vestingReceived).to.equal(TEAM);
-    expect(report.graduation.communityReceived).to.equal(RESERVE);
+    expect(report.distribution.inVesting).to.equal(TEAM);
+    expect(report.distribution.inCommunity).to.equal(RESERVE);
+    expect(report.fees.weth).to.be.greaterThan(0n);
     expect(report.vesting?.releasedAtCliff).to.be.greaterThan(0n);
     expect(report.vesting?.releasedAtEnd).to.equal(TEAM);
-  });
-
-  it("répétition avec une falaise égale à la durée : le temps n'avance jamais à rebours", async function () {
-    const { uniswap, wallet, openAt } = await setup();
-    const report = await runRehearsal(connection, uniswap, {
-      token: TOKEN,
-      curve: { tokenPercent: 95n, curveWholeTokens: 950_000_000n, virtualEthWei: VIRTUAL, targetEthWei: TARGET, openAt },
-      vesting: { enabled: true, durationSeconds: 30n * DAY, cliffSeconds: 30n * DAY, beneficiary: wallet.address },
-    });
-    expect(report.vesting?.releasedAtCliff).to.equal((SUPPLY * 5n) / 100n);
-    expect(report.vesting?.releasedAtEnd).to.equal((SUPPLY * 5n) / 100n);
   });
 });
 
@@ -663,36 +597,36 @@ describe("Échecs définitifs : seul le reçu de NOTRE transaction autorise à r
   async function lenientSetup() {
     const lenient = await network.create({ override: { throwOnTransactionFailures: false, throwOnCallFailures: false } });
     const [, , , operator] = await lenient.ethers.getSigners();
-    const uniswap = await deployLocalUniswapV2(lenient.ethers, operator);
+    const uniswap = await deployLocalUniswapV3(lenient.ethers, operator);
+    const safe = await deployFakeSafe(lenient);
     const wallet = await localWallet(lenient);
-    return { lenient, uniswap, wallet };
+    return { lenient, uniswap, safe, wallet };
   }
 
-  /** Courbe signée et notée avec une ouverture dans 3 min, puis le temps passe : elle échouera sur la chaîne. */
-  async function staleCurveEntry(lenient: NetworkConnection, ctx: StepContext, uniswap: UniswapV2Deployment) {
-    const openAt = (await latest(lenient)) + 180n;
-    const params = launchParams(uniswap, openAt);
+  /** Lanceur signé et noté avec une ouverture dans 3 min, puis le temps passe : il échouera sur la chaîne. */
+  async function staleLauncherEntry(lenient: NetworkConnection, ctx: StepContext, uniswap: UniswapV3Deployment, safe: string) {
+    const params = launchParams(uniswap, safe, (await latest(lenient)) + 180n);
     const fields = {
       name: params.name,
       symbol: params.symbol,
       supplyWholeTokens: params.supply.toString(),
+      positionManager: params.positionManager,
       factory: params.factory,
       weth: params.weth,
-      curveTokenPercent: Number(params.curveTokenPercent),
-      curveWholeTokens: params.curveWholeTokens.toString(),
+      salt: zeroPadValue("0x02", 32),
       vesting: params.vesting,
       vestingWholeTokens: params.vestingWholeTokens.toString(),
       community: params.community,
       communityWholeTokens: params.communityWholeTokens.toString(),
-      virtualEthWei: params.virtualEthWei.toString(),
-      targetEthWei: params.targetEthWei.toString(),
+      feeRecipient: params.feeRecipient,
+      startTick: params.startTick,
       openAt: params.openAt.toString(),
     };
-    const factory = await lenient.ethers.getContractFactory(CURVE_CONTRACT);
-    const payload: TxPayload = { data: (await factory.getDeployTransaction(...curveConstructorArgs(fields))).data };
+    const factory = await lenient.ethers.getContractFactory(LAUNCHER_CONTRACT);
+    const payload: TxPayload = { data: (await factory.getDeployTransaction(...launcherConstructorArgs(fields))).data };
     const nonce = await nextNonce(lenient.ethers.provider, ctx.wallet.address);
     const signed = await signTx(lenient.ethers.provider, ctx.wallet, chainId, payload, nonce);
-    const curve = getCreateAddress({ from: ctx.wallet.address, nonce });
+    const launcher = getCreateAddress({ from: ctx.wallet.address, nonce });
     const entry: TokenRecord = {
       status: "pending",
       from: ctx.wallet.address,
@@ -700,8 +634,8 @@ describe("Échecs définitifs : seul le reçu de NOTRE transaction autorise à r
       txHash: signed.hash,
       rawTx: signed.raw,
       preparedAt: new Date().toISOString(),
-      address: getCreateAddress({ from: curve, nonce: 1 }),
-      curve,
+      address: await predictTokenAddress(lenient.ethers, launcher, fields),
+      launcher,
       ...fields,
     };
     await ctx.journal.write({ network: "test", chainId: chainId.toString(), token: entry });
@@ -709,28 +643,28 @@ describe("Échecs définitifs : seul le reçu de NOTRE transaction autorise à r
     return entry;
   }
 
-  it("une courbe minée en échec remet le journal à l'étape précédente, nonce compté ; la relance prend le suivant", async function () {
-    const { lenient, uniswap, wallet } = await lenientSetup();
+  it("un lanceur miné en échec remet le journal à l'étape précédente, nonce compté ; la relance prend le suivant", async function () {
+    const { lenient, uniswap, safe, wallet } = await lenientSetup();
     const ctx = contextFor(lenient, wallet);
-    const entry = await staleCurveEntry(lenient, ctx, uniswap);
+    const entry = await staleLauncherEntry(lenient, ctx, uniswap, safe);
 
     await expectLaunchError(deployTokenStep(ctx, launchParamsOf(entry)), /a échoué/);
     const after = await ctx.journal.read();
     expect(after?.token).to.equal(undefined);
     expect(after?.nonceFloor).to.equal(entry.nonce + 1);
-    expect(await lenient.ethers.provider.getCode(entry.curve)).to.equal("0x");
+    expect(await lenient.ethers.provider.getCode(entry.launcher)).to.equal("0x");
 
     // Aussitôt, avec un RPC en retard d'une transaction : le nonce consommé n'est pas réutilisé.
-    const token = await deployTokenStep(laggingContext(ctx, 1), launchParams(uniswap, (await latest(lenient)) + 2n * HOUR));
+    const token = await deployTokenStep(laggingContext(ctx, 1), launchParams(uniswap, safe, (await latest(lenient)) + 2n * HOUR));
     expect(token.status).to.equal("confirmed");
     expect(token.nonce).to.equal(entry.nonce + 1);
   });
 
-  it("frais devenus trop bas ET heure d'ouverture passée entre-temps : re-signée avec sa limite de gas d'origine, minée en échec, journal remis", async function () {
-    const { lenient, uniswap, wallet } = await lenientSetup();
+  it("frais devenus trop bas ET heure d'ouverture passée entre-temps : re-signé avec sa limite de gas d'origine, miné en échec, journal remis", async function () {
+    const { lenient, uniswap, safe, wallet } = await lenientSetup();
     const logs: string[] = [];
     const ctx = { ...contextFor(lenient, wallet), log: (message: string) => logs.push(message) };
-    const entry = await staleCurveEntry(lenient, ctx, uniswap);
+    const entry = await staleLauncherEntry(lenient, ctx, uniswap, safe);
     await lenient.networkHelpers.setNextBlockBaseFeePerGas(parseUnits("1000", "gwei"));
     await lenient.networkHelpers.mine();
 
@@ -741,25 +675,42 @@ describe("Échecs définitifs : seul le reçu de NOTRE transaction autorise à r
   });
 });
 
-describe("Après l'ouverture du pool : le token se revend sans taxe sur Uniswap", function () {
-  it("achat puis revente via le routeur, aux montants exacts annoncés", async function () {
-    const { wallet, uniswap, openAt } = await setup();
-    const token = await deployTokenStep(contextFor(connection, wallet), launchParams(uniswap, openAt));
-    await graduate(token.curve);
+describe("Après l'ouverture : achats, reventes et frais", function () {
+  it("aucun échange avant l'heure ; ensuite achat puis revente contre de l'ETH aux montants exacts du quoter, sans taxe", async function () {
+    const { wallet, uniswap, safe, openAt } = await setup();
+    const token = await deployTokenStep(contextFor(connection, wallet), launchParams(uniswap, safe, openAt));
     const trader = (await ethers.getSigners())[9];
-    const router = new Contract(uniswap.router, ROUTER_ABI, trader);
-    const deadline = (await latest()) + 600n;
-    const buyPath = [uniswap.weth, token.address];
-    const [, out] = (await router.getAmountsOut(parseEther("0.01"), buyPath)) as [bigint, bigint];
-    await (await router.swapExactETHForTokens(out, buyPath, trader.address, deadline, { value: parseEther("0.01") })).wait();
+    const swapper = await swapperFor(ethers.provider, uniswap);
+    const ethIn = 10n ** 16n;
+    await expect(swapper.buy(trader, token.address, ethIn, 0n)).to.be.revert(ethers);
+
+    await networkHelpers.time.increaseTo(openAt);
+    const out = await swapper.quoteBuy(token.address, ethIn);
+    await (await swapper.buy(trader, token.address, ethIn, out)).wait();
     expect(await balanceOf(token.address, trader.address)).to.equal(out);
-    await (await new Contract(token.address, ERC20_ABI, trader).approve(uniswap.router, out)).wait();
-    const sellPath = [token.address, uniswap.weth];
-    const [, back] = (await router.getAmountsOut(out, sellPath)) as [bigint, bigint];
-    await (await router.swapExactTokensForETH(out, back, sellPath, trader.address, deadline)).wait();
+
+    await (await new Contract(token.address, ERC20_ABI, trader).approve(swapper.router, out)).wait();
+    const back = await swapper.quoteSell(token.address, out);
+    const before = await ethers.provider.getBalance(trader.address);
+    const receipt = await (await swapper.sell(trader, token.address, out, back)).wait();
+    expect((await ethers.provider.getBalance(trader.address)) - before + (receipt?.fee ?? 0n)).to.equal(back);
     expect(await balanceOf(token.address, trader.address)).to.equal(0n);
-    expect(await new Contract(token.address, ["function walletLimit() view returns (uint256)"], ethers.provider).walletLimit()).to.not.equal(
-      MaxUint256,
-    );
+    expect(back).to.be.lessThan(ethIn); // 2 × 1 % de frais
+  });
+
+  it("les frais d'échange vont au Safe, appelés par n'importe qui ; la liquidité reste", async function () {
+    const { wallet, buyer, uniswap, safe, openAt } = await setup();
+    const token = await deployTokenStep(contextFor(connection, wallet), launchParams(uniswap, safe, openAt));
+    const swapper = await swapperFor(ethers.provider, uniswap);
+    await networkHelpers.time.increaseTo(openAt);
+    await (await swapper.buy(buyer, token.address, 10n ** 16n, 0n)).wait();
+    const status = await readLaunchStatus(ethers.provider, token.launcher);
+    const pending = status.pendingFees?.weth ?? 0n;
+    expect(pending > 10n ** 14n - 10n && pending <= 10n ** 14n).to.equal(true); // 1 % de l'achat, à l'arrondi près
+    const weth = new Contract(uniswap.weth, ERC20_ABI, ethers.provider);
+    await (await new Contract(token.launcher, LAUNCHER_ABI, buyer).collectFees()).wait();
+    expect(await weth.balanceOf(safe)).to.equal(pending);
+    const npm = new Contract(uniswap.positionManager, V3_POSITION_MANAGER_ABI, ethers.provider);
+    expect(await npm.ownerOf(status.positionId)).to.equal(token.launcher);
   });
 });
