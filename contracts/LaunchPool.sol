@@ -66,7 +66,9 @@ interface ILaunchPositionManager {
 ///      Liquidité verrouillée à vie : la position Uniswap (le NFT, « clé » du pool) reste dans
 ///      ce contrat, qui n'a AUCUNE fonction pour la retirer, la réduire ou la transférer.
 ///      Seuls les frais d'échange de la position peuvent en sortir, avec `collectFees`, que
-///      n'importe qui peut appeler, et toujours vers FEE_RECIPIENT (fixé au déploiement).
+///      n'importe qui peut appeler, et toujours partagés de la même façon (fixée au déploiement) :
+///      TEAM_FEE_PERCENT % vers TEAM_FEE_RECIPIENT (Safe de l'équipe), le reste vers
+///      FEE_RECIPIENT (Safe communauté).
 ///
 ///      Pool impossible à piéger : le token est créé avec CREATE2 et un sel inconnu avant la
 ///      transaction, et il crée lui-même son pool ; un pool déjà existant est refusé (le token
@@ -87,6 +89,9 @@ contract LaunchPool {
     /// @dev Tick extrême utilisable avec cet espacement (887272 arrondi à 200).
     int24 private constant MAX_TICK = 887_200;
 
+    /// @notice Part des frais d'échange versée à l'équipe ; le reste va à la communauté.
+    uint256 public constant TEAM_FEE_PERCENT = 40;
+
     /// @dev 10^18 : une unité entière du token en unités de base.
     uint256 private constant UNIT = 1e18;
 
@@ -102,15 +107,17 @@ contract LaunchPool {
     uint256 public immutable OPEN_AT;
     /// @notice Prix de départ : tick du prix « WETH par token » (tick ≈ log1,0001(prix)).
     int24 public immutable START_TICK;
-    /// @notice Reçoit les frais d'échange de la position (WETH et tokens).
+    /// @notice Reçoit 60 % des frais d'échange de la position (WETH et tokens) : Safe communauté.
     address public immutable FEE_RECIPIENT;
+    /// @notice Reçoit 40 % des frais d'échange de la position : Safe de l'équipe.
+    address public immutable TEAM_FEE_RECIPIENT;
     address public immutable VESTING;
     uint256 public immutable VESTING_TOKENS;
     address public immutable COMMUNITY;
     uint256 public immutable COMMUNITY_TOKENS;
 
     event Launched(address indexed token, address indexed pool, uint256 positionId, uint256 poolTokens, int24 startTick);
-    event FeesCollected(uint256 amount0, uint256 amount1);
+    event FeesCollected(uint256 amount0, uint256 amount1, uint256 team0, uint256 team1);
 
     error InvalidParams();
 
@@ -120,7 +127,8 @@ contract LaunchPool {
     /// @param vestingTokens Part équipe.
     /// @param community Safe de la réserve communauté, 0 si aucune réserve.
     /// @param communityTokens Réserve communauté.
-    /// @param feeRecipient Reçoit les frais d'échange de la position (normalement le Safe communauté).
+    /// @param feeRecipient Reçoit 60 % des frais d'échange de la position (le Safe communauté).
+    /// @param teamFeeRecipient Reçoit 40 % des frais d'échange (le Safe de l'équipe).
     /// @param startTick Prix de départ en tick « WETH par token », multiple de 200 (le prix de
     ///        départ par token vaut 1,0001^startTick ETH ; ex. −195 600 ≈ 3,2e-9 ETH).
     /// @param openAt Heure d'ouverture des échanges (dans le futur, à 30 jours au plus).
@@ -132,6 +140,7 @@ contract LaunchPool {
         address community;
         uint256 communityTokens;
         address feeRecipient;
+        address teamFeeRecipient;
         int24 startTick;
         uint256 openAt;
         address positionManager;
@@ -144,7 +153,8 @@ contract LaunchPool {
     constructor(string memory name_, string memory symbol_, Config memory c, bytes32 salt) {
         if (
             c.openAt <= block.timestamp || c.openAt > block.timestamp + 30 days
-                || c.positionManager.code.length == 0 || c.feeRecipient == address(0)
+                || c.positionManager.code.length == 0 || c.feeRecipient.code.length == 0
+                || c.teamFeeRecipient.code.length == 0 || c.teamFeeRecipient == c.feeRecipient
                 || c.vestingTokens + c.communityTokens >= c.supply
                 || (c.vestingTokens > 0 && c.vesting.code.length == 0)
                 || (c.communityTokens > 0 && c.community.code.length == 0)
@@ -176,6 +186,7 @@ contract LaunchPool {
         OPEN_AT = c.openAt;
         START_TICK = c.startTick;
         FEE_RECIPIENT = c.feeRecipient;
+        TEAM_FEE_RECIPIENT = c.teamFeeRecipient;
         VESTING = c.vesting;
         VESTING_TOKENS = vestingAmount;
         COMMUNITY = c.community;
@@ -223,19 +234,32 @@ contract LaunchPool {
         if (extra > 0) t.safeTransfer(DEAD, extra);
     }
 
-    /// @notice Envoie les frais d'échange accumulés par la position à FEE_RECIPIENT. N'importe
-    ///         qui peut l'appeler ; la liquidité, elle, ne peut jamais sortir. Pendant les 24 h
-    ///         de limite anti-bot, l'envoi de tokens peut être refusé si FEE_RECIPIENT dépasse
-    ///         la limite : il suffit de rappeler plus tard.
+    /// @notice Partage les frais d'échange accumulés par la position : TEAM_FEE_PERCENT % au Safe
+    ///         de l'équipe, le reste au Safe communauté. N'importe qui peut l'appeler ; la
+    ///         liquidité, elle, ne peut jamais sortir. Pendant les 24 h de limite anti-bot, l'envoi
+    ///         de tokens peut être refusé si un destinataire dépasse la limite (le Safe communauté
+    ///         détient déjà 3 %) : il suffit de rappeler plus tard.
     function collectFees() external returns (uint256 amount0, uint256 amount1) {
         (amount0, amount1) = POSITION_MANAGER.collect(
             ILaunchPositionManager.CollectParams({
                 tokenId: POSITION_ID,
-                recipient: FEE_RECIPIENT,
+                recipient: address(this),
                 amount0Max: type(uint128).max,
                 amount1Max: type(uint128).max
             })
         );
-        emit FeesCollected(amount0, amount1);
+        address token0 = ILaunchV3Pool(POOL).token0();
+        address token1 = token0 == address(TOKEN) ? WETH : address(TOKEN);
+        uint256 team0 = _split(token0, amount0);
+        uint256 team1 = _split(token1, amount1);
+        emit FeesCollected(amount0, amount1, team0, team1);
+    }
+
+    /// @dev Envoie TEAM_FEE_PERCENT % de `amount` à l'équipe et le reste à la communauté.
+    function _split(address asset, uint256 amount) private returns (uint256 team) {
+        if (amount == 0) return 0;
+        team = amount * TEAM_FEE_PERCENT / 100;
+        if (team > 0) IERC20(asset).safeTransfer(TEAM_FEE_RECIPIENT, team);
+        IERC20(asset).safeTransfer(FEE_RECIPIENT, amount - team);
     }
 }

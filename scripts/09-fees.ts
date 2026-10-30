@@ -1,7 +1,8 @@
 /**
- * Verse au Safe communauté les frais d'échange (1 %) accumulés par la position
- * du lancement. N'importe qui peut déclencher ce versement : les frais vont
- * toujours au Safe, et la liquidité, elle, ne peut jamais sortir. Aucun risque
+ * Partage les frais d'échange (1 %) accumulés par la position du lancement :
+ * 60 % au Safe communauté, 40 % au Safe de l'équipe. N'importe qui peut
+ * déclencher ce versement : les frais vont toujours à ces deux Safes, et la
+ * liquidité, elle, ne peut jamais sortir. Aucun risque
  * de doublon : un second appel ne verse que ce qui s'est accumulé entre-temps.
  *
  *   npm run fees:mainnet
@@ -39,25 +40,33 @@ async function collect(connection: NetworkConnection, profile: NetworkProfile): 
   const status = await readLaunchStatus(ethers.provider, token.launcher);
   heading(`Frais d'échange — ${profile.label}`);
   row("Lanceur", status.launcher);
-  row("Versés à (Safe)", status.feeRecipient);
+  const communityPercent = 100n - status.teamFeePercent;
+  row("Safe communauté", `${status.feeRecipient} (${communityPercent} %)`);
+  row("Safe de l'équipe", `${status.teamFeeRecipient} (${status.teamFeePercent} %)`);
   if (status.pendingFees === undefined) {
     throw new LaunchError(
-      "Le versement serait refusé pour l'instant : pendant les 24 h qui suivent l'ouverture, le Safe détient déjà " +
+      "Le versement serait refusé pour l'instant : pendant les 24 h qui suivent l'ouverture, le Safe communauté détient déjà " +
         "plus que la limite par wallet. Réessaie après. Rien n'a été envoyé.",
     );
   }
   row("En attente", `${formatEth(status.pendingFees.weth)} et ${formatTokenAmount(status.pendingFees.tokens)} ${token.symbol}`);
+  const teamShare = (amount: bigint) => (amount * status.teamFeePercent) / 100n;
+  row(
+    "Partage prévu",
+    `équipe ${formatEth(teamShare(status.pendingFees.weth))} et ${formatTokenAmount(teamShare(status.pendingFees.tokens))} ${token.symbol}, ` +
+      `communauté le reste`,
+  );
   if (status.pendingFees.weth === 0n && status.pendingFees.tokens === 0n) {
     console.log("\n  Rien à verser pour l'instant.");
     return;
   }
   if (profile.isMainnet) {
-    await confirmByTypingSymbol(token.symbol, "verser les frais d'échange au Safe communauté");
+    await confirmByTypingSymbol(token.symbol, "partager les frais d'échange entre le Safe communauté et le Safe de l'équipe");
   }
 
   const [signer] = await ethers.getSigners();
   const launcher = new Contract(token.launcher, LAUNCHER_ABI, signer);
-  console.log("\nVersement au Safe…");
+  console.log("\nVersement aux deux Safes…");
   const tx = await launcher.collectFees();
   console.log(`  Transaction envoyée : ${tx.hash as string}`);
   const receipt = await tx.wait();
@@ -76,11 +85,16 @@ async function collect(connection: NetworkConnection, profile: NetworkProfile): 
   const collected = receipt.logs
     .map((log: { topics: string[]; data: string }) => launcherInterface.parseLog(log))
     .find((parsed: ReturnType<Interface["parseLog"]>) => parsed?.name === "FeesCollected");
-  const [amount0, amount1] = [(collected?.args[0] as bigint | undefined) ?? 0n, (collected?.args[1] as bigint | undefined) ?? 0n];
-  const [tokens, weth] = status.state.tokenIsToken0 ? [amount0, amount1] : [amount1, amount0];
+  const arg = (index: number) => (collected?.args[index] as bigint | undefined) ?? 0n;
+  const [amount0, amount1, team0, team1] = [arg(0), arg(1), arg(2), arg(3)];
+  const [tokens, weth, teamTokens, teamWeth] = status.state.tokenIsToken0
+    ? [amount0, amount1, team0, team1]
+    : [amount1, amount0, team1, team0];
 
   heading("Frais versés");
-  row("Au Safe", `${formatEth(weth)} et ${formatTokenAmount(tokens)} ${token.symbol}`);
+  row("Au total", `${formatEth(weth)} et ${formatTokenAmount(tokens)} ${token.symbol}`);
+  row("Safe de l'équipe", `${formatEth(teamWeth)} et ${formatTokenAmount(teamTokens)} ${token.symbol}`);
+  row("Safe communauté", `${formatEth(weth - teamWeth)} et ${formatTokenAmount(tokens - teamTokens)} ${token.symbol}`);
   row("Transaction", receipt.hash);
   row("Explorateur", explorerLink(profile, "tx", receipt.hash) ?? "—");
 }

@@ -111,7 +111,7 @@ async function latest(conn: NetworkConnection = connection): Promise<bigint> {
   return BigInt(await conn.networkHelpers.time.latest());
 }
 
-/** Safe d'essai 2 sur 3 (déployé par un autre compte : le nonce du wallet de lancement ne bouge pas). */
+/** Safe d'essai 2 sur 3 (déployé par un autre compte : le nonce du wallet de lancement ne bouge pas). Deux appels = deux Safes. */
 async function deployFakeSafe(conn: NetworkConnection): Promise<string> {
   const signers = await conn.ethers.getSigners();
   const singleton = await conn.ethers.deployContract("MockSafeSingleton", ["1.4.1"], signers[3]);
@@ -123,7 +123,10 @@ async function deployFakeSafe(conn: NetworkConnection): Promise<string> {
   return await safe.getAddress();
 }
 
-/** Paramètres du lanceur : par défaut tout dans le pool, frais au Safe, ni part ni réserve. */
+/** Safe de l'équipe des tests (40 % des frais), fixé une fois par la fixture. */
+let TEAM_SAFE = ZeroAddress;
+
+/** Paramètres du lanceur : par défaut tout dans le pool, frais partagés entre les Safes, ni part ni réserve. */
 function launchParams(
   uniswap: UniswapV3Deployment,
   safe: string,
@@ -143,6 +146,7 @@ function launchParams(
     community: split.communityWholeTokens > 0n ? safe : ZeroAddress,
     communityWholeTokens: split.communityWholeTokens,
     feeRecipient: safe,
+    teamFeeRecipient: TEAM_SAFE,
     salt: share?.salt,
   };
 }
@@ -151,13 +155,15 @@ async function setupFixture() {
   const [deployer, buyer, attacker, operator] = await ethers.getSigners();
   const uniswap = await deployLocalUniswapV3(ethers, operator);
   const safe = await deployFakeSafe(connection);
+  const teamSafe = await deployFakeSafe(connection);
   const wallet = await localWallet(connection);
   expect(wallet.address).to.equal(deployer.address);
-  return { deployer, buyer, attacker, uniswap, safe, wallet };
+  return { deployer, buyer, attacker, uniswap, safe, teamSafe, wallet };
 }
 
 async function setup() {
   const fixture = await networkHelpers.loadFixture(setupFixture);
+  TEAM_SAFE = fixture.teamSafe;
   return { ...fixture, openAt: (await latest()) + 2n * HOUR };
 }
 
@@ -191,6 +197,8 @@ describe("Déploiement du lanceur (vrai bytecode Uniswap v3)", function () {
     expect(status.pool).to.equal(token.pool);
     expect(status.positionId.toString()).to.equal(token.positionId);
     expect(status.feeRecipient).to.equal(safe);
+    expect(status.teamFeeRecipient).to.equal(TEAM_SAFE);
+    expect(status.teamFeePercent).to.equal(40n);
     expect(status.state.tokenBalance).to.equal(status.poolTokens);
     expect(status.state.wethBalance).to.equal(0n);
     expect(status.walletLimit).to.equal(MaxUint256); // pas de limite avant l'heure (et aucun achat possible)
@@ -218,7 +226,7 @@ describe("Déploiement du lanceur (vrai bytecode Uniswap v3)", function () {
     expect(await ethers.provider.getTransactionCount(wallet.address)).to.equal(nonce);
   });
 
-  it("refuse, par simulation et sans rien envoyer, un contrat de blocage sans code ou un tick invalide", async function () {
+  it("refuse, par simulation et sans rien envoyer, un contrat de blocage sans code, un tick invalide ou un seul Safe pour les frais", async function () {
     const { wallet, buyer, uniswap, safe, openAt } = await setup();
     const ctx = contextFor(connection, wallet);
     const nonce = await ethers.provider.getTransactionCount(wallet.address);
@@ -227,6 +235,8 @@ describe("Déploiement du lanceur (vrai bytecode Uniswap v3)", function () {
       /simulation.*refuse ses paramètres/,
     );
     await expectLaunchError(deployTokenStep(ctx, { ...launchParams(uniswap, safe, openAt), startTick: START_TICK + 1 }), /simulation/);
+    // Même Safe pour la communauté et l'équipe : refusé par le contrat.
+    await expectLaunchError(deployTokenStep(ctx, { ...launchParams(uniswap, safe, openAt), teamFeeRecipient: safe }), /simulation/);
     expect(await ctx.journal.read()).to.equal(undefined);
     expect(await ethers.provider.getTransactionCount(wallet.address)).to.equal(nonce);
   });
@@ -238,7 +248,10 @@ describe("Déploiement du lanceur (vrai bytecode Uniswap v3)", function () {
       pool: { startMarketCapWei: 3n * UNIT, startTick: START_TICK, openAt },
       vestingPercent: 0n,
       community: { percent: 0n, beneficiary: safe },
+      teamSafe: TEAM_SAFE,
     });
+    expect(report.teamSafe).to.deep.equal({ address: TEAM_SAFE, fakeSafe: false });
+    expect(report.fees.teamWeth).to.equal((report.fees.weth * 40n) / 100n);
     expect(report.antiBot.buyBeforeOpenBlocked).to.equal(true);
     expect(report.antiBot.bigBuyBlocked).to.equal(true);
     expect(report.antiBot.limitAtOpen).to.equal(SUPPLY / 200n);
@@ -270,6 +283,7 @@ describe("Reprise après interruption : jamais de double envoi", function () {
       community: params.community,
       communityWholeTokens: params.communityWholeTokens.toString(),
       feeRecipient: params.feeRecipient,
+      teamFeeRecipient: params.teamFeeRecipient,
       startTick: params.startTick,
       openAt: params.openAt.toString(),
     };
@@ -583,6 +597,8 @@ describe("Ta part et la réserve : blocage et Safe avant le lanceur, servis au d
       community: { percent: 3n, beneficiary: undefined },
     });
     expect(report.communitySafe.fakeSafe).to.equal(true);
+    expect(report.teamSafe.fakeSafe).to.equal(true);
+    expect(report.teamSafe.address).to.not.equal(report.communitySafe.address);
     expect(report.vestingRecord?.nonce).to.be.lessThan(report.token.nonce);
     expect(report.distribution.inVesting).to.equal(TEAM);
     expect(report.distribution.inCommunity).to.equal(RESERVE);
@@ -599,6 +615,7 @@ describe("Échecs définitifs : seul le reçu de NOTRE transaction autorise à r
     const [, , , operator] = await lenient.ethers.getSigners();
     const uniswap = await deployLocalUniswapV3(lenient.ethers, operator);
     const safe = await deployFakeSafe(lenient);
+    TEAM_SAFE = await deployFakeSafe(lenient);
     const wallet = await localWallet(lenient);
     return { lenient, uniswap, safe, wallet };
   }
@@ -619,6 +636,7 @@ describe("Échecs définitifs : seul le reçu de NOTRE transaction autorise à r
       community: params.community,
       communityWholeTokens: params.communityWholeTokens.toString(),
       feeRecipient: params.feeRecipient,
+      teamFeeRecipient: params.teamFeeRecipient,
       startTick: params.startTick,
       openAt: params.openAt.toString(),
     };
@@ -698,7 +716,7 @@ describe("Après l'ouverture : achats, reventes et frais", function () {
     expect(back).to.be.lessThan(ethIn); // 2 × 1 % de frais
   });
 
-  it("les frais d'échange vont au Safe, appelés par n'importe qui ; la liquidité reste", async function () {
+  it("les frais d'échange sont partagés 60 % Safe communauté / 40 % Safe équipe, appelés par n'importe qui ; la liquidité reste", async function () {
     const { wallet, buyer, uniswap, safe, openAt } = await setup();
     const token = await deployTokenStep(contextFor(connection, wallet), launchParams(uniswap, safe, openAt));
     const swapper = await swapperFor(ethers.provider, uniswap);
@@ -709,7 +727,9 @@ describe("Après l'ouverture : achats, reventes et frais", function () {
     expect(pending > 10n ** 14n - 10n && pending <= 10n ** 14n).to.equal(true); // 1 % de l'achat, à l'arrondi près
     const weth = new Contract(uniswap.weth, ERC20_ABI, ethers.provider);
     await (await new Contract(token.launcher, LAUNCHER_ABI, buyer).collectFees()).wait();
-    expect(await weth.balanceOf(safe)).to.equal(pending);
+    const team = (pending * 40n) / 100n;
+    expect(await weth.balanceOf(TEAM_SAFE)).to.equal(team);
+    expect(await weth.balanceOf(safe)).to.equal(pending - team);
     const npm = new Contract(uniswap.positionManager, V3_POSITION_MANAGER_ABI, ethers.provider);
     expect(await npm.ownerOf(status.positionId)).to.equal(token.launcher);
   });

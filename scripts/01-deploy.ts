@@ -2,7 +2,8 @@
  * Étape 1 — Lance le token : déploie le contrat de blocage de ta part (vesting),
  * puis le lanceur (LaunchPool), qui crée le token, verse ta part au blocage et la
  * réserve au Safe communauté, crée le pool Uniswap v3 TOKEN/WETH (1 %) et y place
- * tout le reste d'un seul côté, verrouillé à vie. Vérifie ensuite les trois codes
+ * tout le reste d'un seul côté, verrouillé à vie. Les frais d'échange du pool iront
+ * pour 60 % au Safe communauté et pour 40 % au Safe de l'équipe. Vérifie ensuite les trois codes
  * sources sur Blockscout.
  *
  *   npm run deploy:mainnet
@@ -60,6 +61,7 @@ import { assertUniswapV3Deployment } from "./lib/uniswap.ts";
 import {
   validateCommunityParams,
   validatePoolParams,
+  validateTeamParams,
   validateTokenParams,
   validateVestingParams,
   validateVestingPercent,
@@ -180,6 +182,9 @@ async function deploy(connection: NetworkConnection, profile: NetworkProfile, un
     }
     await assertSafe(ethers.provider, reserve.beneficiary, signer.address, "Le wallet communauté");
     const safe = reserve.beneficiary;
+    // Safe de l'équipe : 40 % des frais d'échange ; un autre vrai Safe 2 sur 3, lui aussi existant avant.
+    const teamSafe = validateTeamParams(launchConfig.team, signer.address, safe);
+    await assertSafe(ethers.provider, teamSafe, signer.address, "Le Safe de l'équipe");
 
     // Estimations : le lanceur exige un contrat de blocage existant, d'où une adresse de contrat
     // quelconque (le routeur) à sa place tant qu'il n'est pas déployé ; le gas est le même.
@@ -192,6 +197,7 @@ async function deploy(connection: NetworkConnection, profile: NetworkProfile, un
       community: split.communityWholeTokens > 0n ? safe : ZeroAddress,
       communityWholeTokens: split.communityWholeTokens.toString(),
       feeRecipient: safe,
+      teamFeeRecipient: teamSafe,
       startTick: pool.startTick,
       openAt: pool.openAt.toString(),
       positionManager: uniswap.positionManager,
@@ -253,7 +259,8 @@ async function deploy(connection: NetworkConnection, profile: NetworkProfile, un
       );
     }
     row("Safe communauté", `${safe} (Safe 2 sur 3 vérifié sur la chaîne ✔)`);
-    row("Frais d'échange (1 %)", "versés au Safe communauté (npm run fees:mainnet, par n'importe qui)");
+    row("Safe de l'équipe", `${teamSafe} (Safe 2 sur 3 vérifié sur la chaîne ✔)`);
+    row("Frais du pool 1 %", "60 % Safe communauté, 40 % Safe équipe (npm run fees:mainnet, par n'importe qui)");
     row("Gas estimé", (launcherEstimate.gas + vestingEstimate.gas).toString());
     row("Coût maximal estimé", formatEth(maxCost));
 
@@ -285,6 +292,7 @@ async function deploy(connection: NetworkConnection, profile: NetworkProfile, un
       community: launchFields.community,
       communityWholeTokens: split.communityWholeTokens,
       feeRecipient: safe,
+      teamFeeRecipient: teamSafe,
     };
     token = await deployTokenStep(ctx, params);
   }
@@ -295,7 +303,8 @@ async function deploy(connection: NetworkConnection, profile: NetworkProfile, un
   row("Pool Uniswap v3", token.pool ?? "—");
   row("Ouverture des échanges", formatOpenAt(BigInt(token.openAt)));
   if (vesting !== undefined && BigInt(token.vestingWholeTokens) > 0n) row("Contrat de blocage", vesting.address);
-  row("Safe communauté", token.feeRecipient);
+  row("Safe communauté (60 % des frais)", token.feeRecipient);
+  row("Safe équipe (40 % des frais)", token.teamFeeRecipient);
   row("Transaction", token.txHash);
   row("Explorateur (token)", explorerLink(profile, "token", token.address) ?? "—");
   row("Explorateur (pool)", token.pool === undefined ? "—" : (explorerLink(profile, "address", token.pool) ?? "—"));

@@ -5,7 +5,8 @@ un **pool Uniswap v3 d'un seul côté** : tu n'apportes aucun ETH. Au déploieme
 est placé dans un vrai pool Uniswap v3 TOKEN/WETH (1 % de frais), à partir d'un prix de
 départ choisi ; chaque achat fait monter le prix, l'ETH des acheteurs reste dans le pool,
 et la liquidité est **verrouillée à vie**. Ta part va à un contrat de blocage (vesting),
-la réserve et les frais d'échange à un Safe communauté. Vérification du code sur
+la réserve à un Safe communauté, et les frais d'échange du pool sont partagés : 60 % au
+Safe communauté, 40 % au Safe de l'équipe. Vérification du code sur
 Blockscout et répétition générale sur une copie locale du mainnet comprises.
 
 Utilise un wallet neuf, dédié à ce token.
@@ -27,8 +28,10 @@ C'est lui que tu déploies. En **une seule transaction**, il :
   dans le lanceur, qui n'a **aucune** fonction pour la retirer, la réduire ou la
   transférer.
 - **Frais d'échange** : 1 % de chaque achat et revente dans la position. Seuls ces frais
-  peuvent sortir, avec `collectFees`, que n'importe qui peut appeler, et toujours vers le
-  Safe communauté (fixé au déploiement).
+  peuvent sortir, avec `collectFees`, que n'importe qui peut appeler : **40 %** (arrondi
+  vers le bas) vont toujours au Safe de l'équipe, le reste (**60 %**) au Safe communauté,
+  pour l'ETH comme pour les tokens. Les deux adresses sont fixées au déploiement et
+  doivent être différentes.
 - **Pool impossible à piéger** : l'adresse du token dépend d'un sel inconnu avant la
   diffusion, et un pool existant est refusé : personne ne peut fixer le prix à ta place.
 - Pas d'owner, aucune fonction d'administration, rien de modifiable.
@@ -90,9 +93,10 @@ toujours. Le bénéficiaire peut seulement se faire remplacer par une autre adre
 - Un peu d'ETH sur Robinhood Chain pour les **frais seulement** (deux déploiements) : tu
   n'apportes aucun ETH au pool. Ponts listés dans la doc :
   <https://docs.robinhood.com/chain/bridging> (pont Arbitrum officiel, Relay, Across, etc.).
-- Le **Safe communauté** (2 sur 3, sur app.safe.global, réseau Robinhood Chain) créé
-  **avant** le déploiement : il reçoit la réserve et les frais, son adresse est gravée
-  dans le lanceur.
+- Le **Safe communauté** et le **Safe de l'équipe** (2 sur 3 chacun, sur app.safe.global,
+  réseau Robinhood Chain, avec les mêmes 3 clés mais deux adresses différentes), créés
+  **avant** le déploiement : le premier reçoit la réserve et 60 % des frais, le second
+  40 % des frais. Leurs adresses sont gravées dans le lanceur.
 - Recommandé pour le jour J : une clé RPC Alchemy (le RPC public est limité en débit).
 
 ```bash
@@ -120,7 +124,10 @@ pool: {
 },
 community: {
   percent: 3,                // réserve communauté (concours, récompenses), 0 = aucune
-  beneficiary: "",           // Safe 2 sur 3 dédié : réserve ET frais d'échange (obligatoire)
+  beneficiary: "",           // Safe 2 sur 3 dédié : réserve ET 60 % des frais d'échange (obligatoire)
+},
+team: {
+  safe: "",                  // Safe 2 sur 3 de l'équipe : 40 % des frais d'échange (obligatoire)
 },
 vesting: {
   enabled: true,             // ta part ne peut exister que bloquée
@@ -164,11 +171,12 @@ Blockscout et DexScreener : au-delà de 10 %, une part de créateur est vue comm
 Ta part ne peut exister que **bloquée** (`vesting.enabled: true`) ; avec
 `vesting.percent: 0`, aucun contrat de blocage n'est déployé.
 
-**Le Safe communauté** reçoit la réserve au déploiement et les frais d'échange ensuite :
-annonce son adresse, tout le monde peut suivre son solde. Le script vérifie sur la
-chaîne, avant de déployer, que c'est un vrai Safe (version officielle, au moins 2
-signatures sur 3 propriétaires, sans module ni garde) dont le wallet de déploiement n'est
-**pas** propriétaire.
+**Les deux Safes.** Le Safe communauté reçoit la réserve au déploiement et 60 % des frais
+d'échange ensuite ; le Safe de l'équipe (`team.safe`) reçoit les 40 % restants des frais.
+Annonce leurs adresses : tout le monde peut suivre leurs soldes. Le script vérifie sur la
+chaîne, avant de déployer, que ce sont deux vrais Safes distincts (version officielle, au
+moins 2 signatures sur 3 propriétaires, sans module ni garde) dont le wallet de
+déploiement n'est **pas** propriétaire.
 
 ### 2. Les secrets — keystore chiffré de Hardhat
 
@@ -192,19 +200,19 @@ Sans `ROBINHOOD_RPC_URL`, le RPC public de la doc est utilisé
 | # | Commande | Réseau | Ce qui se passe |
 | --- | --- | --- | --- |
 | 1 | `npm test` | local | Tests Solidity (dont fuzzing) et tests du lancement complet |
-| 2 | `npm run rehearsal` | copie locale du mainnet | Lancement complet avec les vrais contrats Uniswap v3 : blocage, lanceur, achats refusés avant l'heure et au-delà de 0,5 %, petits achats, revente, gros achat après 24 h, frais au Safe |
+| 2 | `npm run rehearsal` | copie locale du mainnet | Lancement complet avec les vrais contrats Uniswap v3 : blocage, lanceur, achats refusés avant l'heure et au-delà de 0,5 %, petits achats, revente, gros achat après 24 h, frais partagés 60/40 entre les deux Safes |
 | 3 | `npm run deploy:mainnet` | **mainnet** | Contrat de blocage, puis lanceur (token, part, réserve, pool, liquidité verrouillée), + vérification Blockscout des trois |
 | 4 | — | — | Annonce l'heure d'ouverture et l'adresse du token. À `openAt`, les échanges s'ouvrent tout seuls |
-| 5 | `npm run status:mainnet` | mainnet, lecture seule | Ouvert ou non, prix, ETH et tokens dans le pool, frais en attente, limite par wallet, ta part, le Safe |
-| plus tard | `npm run fees:mainnet` | mainnet | Verse au Safe les frais d'échange accumulés (n'importe quel wallet peut le faire) |
+| 5 | `npm run status:mainnet` | mainnet, lecture seule | Ouvert ou non, prix, ETH et tokens dans le pool, frais en attente, limite par wallet, ta part, les deux Safes et leurs soldes |
+| plus tard | `npm run fees:mainnet` | mainnet | Partage les frais d'échange accumulés : 60 % Safe communauté, 40 % Safe équipe (n'importe quel wallet peut le faire) |
 | plus tard | `npm run release:mainnet` | mainnet | Après la falaise : verse au bénéficiaire ce qui est libéré |
 
 Le contrat de blocage est déployé par la même commande, juste avant le lanceur, qui le
 remplit aussitôt. Ton wallet ne détient jamais de tokens.
 
 La répétition (étape 2) avance le temps sur sa copie locale : ouverture, 24 h de limite,
-puis falaise et fin du blocage. Sans Safe communauté dans la config, elle déploie un Safe
-d'essai 2 sur 3 sur sa copie locale.
+puis falaise et fin du blocage. Sans Safes dans la config, elle déploie des Safes d'essai
+2 sur 3 sur sa copie locale, et vérifie le partage 60/40 des frais.
 
 Sur le mainnet, le script affiche d'abord son plan complet (répartition, prix,
 capitalisation, coût de 0,5 %, heure d'ouverture, calendrier du blocage, adresses, frais
@@ -230,7 +238,8 @@ en parallèle) : les scripts gèrent eux-mêmes l'ordre de ses transactions (non
 - Les adresses Uniswap v3 pointent vers de vrais contrats : le gestionnaire de positions,
   le routeur et le quoter annoncent bien la factory et le WETH attendus, et le niveau de
   frais 1 % a un espacement de 200 ticks.
-- Le Safe communauté est un vrai Safe 2 sur 3 sans le wallet de déploiement. Le
+- Le Safe communauté et le Safe de l'équipe sont deux vrais Safes 2 sur 3 distincts, sans
+  le wallet de déploiement. Le
   bénéficiaire du blocage est un wallet ordinaire, avec sa casse d'origine, différent du
   wallet de déploiement sur le mainnet.
 - Le solde couvre les frais. Le plan signale si le wallet a déjà envoyé des transactions
@@ -240,7 +249,7 @@ en parallèle) : les scripts gèrent eux-mêmes l'ordre de ses transactions (non
 
 **Après**
 - Le lanceur et le token sont relus sur la chaîne (adresse du token, heure d'ouverture,
-  tick de départ, destinataire des frais, nom, symbole, offre) avant de noter le
+  tick de départ, les deux destinataires des frais, nom, symbole, offre) avant de noter le
   déploiement confirmé, avec l'adresse du pool et le numéro de la position.
 - Les codes du lanceur, du token (créé par le lanceur) et du contrat de blocage sont
   vérifiés sur Blockscout : tout le monde peut lire les règles.
@@ -291,9 +300,10 @@ en parallèle) : les scripts gèrent eux-mêmes l'ordre de ses transactions (non
   utiliser plusieurs wallets : la limite rend l'accaparement plus cher, pas impossible.
 - **Rien à faire à l'heure d'ouverture** : les échanges s'ouvrent tout seuls.
   `npm run status:mainnet` montre le prix, l'ETH dans le pool et les frais en attente.
-- **Frais d'échange** : `npm run fees:mainnet` les verse au Safe. Pendant les 24 h qui
-  suivent l'ouverture, le versement peut être refusé (le Safe détient déjà la réserve, au
-  delà de la limite par wallet) : attends la fin des 24 h.
+- **Frais d'échange** : `npm run fees:mainnet` les partage entre les deux Safes (60 %
+  communauté, 40 % équipe). Pendant les 24 h qui suivent l'ouverture, le versement peut
+  être refusé (le Safe communauté détient déjà la réserve, au-delà de la limite par
+  wallet) : attends la fin des 24 h.
 - **Frais réseau.** Les montants de gas affichés par la répétition sont ceux de
   l'exécution ; sur Robinhood Chain, chaque transaction paie aussi une part « données L1 ».
 - **Après le lancement.** Ajoute logo, description et liens (section suivante). Annonce
@@ -409,7 +419,7 @@ bytecode déployé correspond toujours à celui que Blockscout recompile.
   transferts au montant exact, autorisations, refus de l'ETH).
 - `test/launch-v3.ts` : le lanceur contre le vrai bytecode Uniswap v3 (token en token0 et
   en token1) : répartition, prix de départ, position gardée pour toujours, achats refusés
-  avant l'heure et au-delà de la limite, revente, frais au Safe, pool créé d'avance refusé,
+  avant l'heure et au-delà de la limite, revente, frais partagés 60/40 entre les deux Safes, pool créé d'avance refusé,
   paramètres invalides refusés.
 - `contracts/TokenVesting.t.sol` : calendrier du blocage (rien avant la falaise,
   libération linéaire, tout à la fin), versement toujours au bénéficiaire quel que soit
@@ -463,7 +473,7 @@ bytecode déployé correspond toujours à celui que Blockscout recompile.
   - blocage : déployé avant le lanceur, rempli au déploiement, libération dans le temps
     (falaise puis fin, à partir de l'ouverture), personne ne peut retirer plus tôt ;
   - après l'ouverture : achat et revente contre de l'ETH aux montants exacts du quoter,
-    frais versés au Safe par n'importe qui ;
+    frais partagés 60/40 entre le Safe communauté et le Safe de l'équipe, par n'importe qui ;
   - répétitions complètes (sans part, avec blocage et Safe d'essai).
 
 ```bash
@@ -666,7 +676,7 @@ scripts/
   05-release.ts          versement de ta part libérée au bénéficiaire
   06-deploy-nft.ts       déploiement des cartes NFT + vérification Blockscout
   07-deploy-game.ts      déploiement du jeu (genèse du site) + vérification Blockscout
-  09-fees.ts             versement des frais d'échange au Safe communauté
+  09-fees.ts             partage des frais d'échange : 60 % Safe communauté, 40 % Safe équipe
   lib/                   étapes, journal, contrôles : partagés par les scripts et les tests
 test/                    tests TypeScript (Mocha)
 deployments/             journal du lancement, créé au premier envoi
@@ -696,7 +706,8 @@ hardhat.config.ts        réseaux, compilateur, Blockscout
 | « Le contrat de blocage déjà déployé … commence le … » | Remets dans `pool.openAt` l'heure de la première exécution, ou retire seulement l'entrée `"vesting"` du journal (ce contrat est vide) pour en déployer un neuf. |
 | « Ta part … ne peut exister que bloquée » | Mets `vesting.enabled: true`, ou `vesting.percent: 0`. |
 | « pool.startMarketCapEth donne un prix … hors des bornes » | La capitalisation de départ donnerait au moins 1 ETH par token (ou un prix quasi nul) : change-la, ou change l'offre. |
-| « community.beneficiary est obligatoire » | Le Safe communauté reçoit la réserve et les frais d'échange : crée-le et colle son adresse. |
+| « community.beneficiary est obligatoire » | Le Safe communauté reçoit la réserve et 60 % des frais d'échange : crée-le et colle son adresse. |
+| « team.safe est obligatoire » / « différent du Safe communauté » | Crée le Safe de l'équipe (2 sur 3, mêmes clés, autre adresse) et colle son adresse dans `team.safe`. |
 | « Le versement serait refusé pour l'instant » (frais) | Pendant les 24 h qui suivent l'ouverture, le Safe détient déjà plus que la limite par wallet : réessaie après. |
 | « … n'est pas un Safe valide » | Crée le Safe communauté sur app.safe.global (2 signatures sur 3 propriétaires, sans le wallet de déploiement) et colle son adresse dans `community.beneficiary`. |
 | « La simulation du déploiement du lanceur a échoué » | Le message donne la raison ; rien n'a été envoyé. |

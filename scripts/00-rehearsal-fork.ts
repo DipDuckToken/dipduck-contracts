@@ -23,6 +23,7 @@ import {
   isPlaceholder,
   validateCommunityParams,
   validatePoolParams,
+  validateTeamParams,
   validateTokenParams,
   validateVestingParams,
   validateVestingPercent,
@@ -73,6 +74,11 @@ await runScript(async () => {
   } else {
     community = validateCommunityParams(launchConfig.community, deployer.address, vestingPercent);
   }
+  // Safe de l'équipe pas encore choisi : un second Safe d'essai le remplace.
+  const teamSafe =
+    launchConfig.team.safe.trim() === ""
+      ? undefined
+      : validateTeamParams(launchConfig.team, deployer.address, community.beneficiary);
 
   heading("Répétition générale — copie locale du mainnet");
   row("Bloc de départ", `${block.number} (${new Date(block.timestamp * 1000).toISOString()})`);
@@ -86,7 +92,7 @@ await runScript(async () => {
   const report = await runRehearsal(
     connection,
     profile.uniswapV3,
-    { token: params, pool, vestingPercent, vesting, community },
+    { token: params, pool, vestingPercent, vesting, community, teamSafe },
     (message) => console.log(`  ${message}`),
   );
   const { plan, antiBot, distribution, status, gasUsed } = report;
@@ -118,7 +124,13 @@ await runScript(async () => {
   );
   row("Revente", `${tokens(report.resale.tokensIn)} → ${formatEth(report.resale.ethOut)} (montant exact ✔)`);
   row("Après 24 h", `${formatEth(antiBot.bigBuyAfter24h.ethIn)} → ${tokens(antiBot.bigBuyAfter24h.tokensOut)} (gros achat accepté ✔)`);
-  row("Frais versés au Safe", `${formatEth(report.fees.weth)} et ${tokens(report.fees.tokens)} ✔`);
+  row("Frais du pool versés", `${formatEth(report.fees.weth)} et ${tokens(report.fees.tokens)}`);
+  row("", `Safe communauté (60 %) : ${formatEth(report.fees.communityWeth)} et ${tokens(report.fees.communityTokens)} ✔`);
+  row(
+    "",
+    `Safe équipe (40 %) : ${formatEth(report.fees.teamWeth)} et ${tokens(report.fees.teamTokens)} ✔` +
+      (report.teamSafe.fakeSafe ? " — Safe d'essai : renseigne team.safe avant le vrai lancement" : ""),
+  );
   row("ETH dans le pool", formatEth(status.state.wethBalance));
   row("Prix final", `${formatRatio(status.state.priceWei, UNIT)} ETH par ${symbol}`);
   if (report.vesting !== undefined) {

@@ -16,13 +16,15 @@ export const LAUNCHER_ABI = [
   "function OPEN_AT() view returns (uint256)",
   "function START_TICK() view returns (int24)",
   "function FEE_RECIPIENT() view returns (address)",
+  "function TEAM_FEE_RECIPIENT() view returns (address)",
+  "function TEAM_FEE_PERCENT() view returns (uint256)",
   "function VESTING() view returns (address)",
   "function VESTING_TOKENS() view returns (uint256)",
   "function COMMUNITY() view returns (address)",
   "function COMMUNITY_TOKENS() view returns (uint256)",
   "function collectFees() returns (uint256 amount0, uint256 amount1)",
   "event Launched(address indexed token, address indexed pool, uint256 positionId, uint256 poolTokens, int24 startTick)",
-  "event FeesCollected(uint256 amount0, uint256 amount1)",
+  "event FeesCollected(uint256 amount0, uint256 amount1, uint256 team0, uint256 team1)",
   "error InvalidParams()",
   "error PoolAlreadyExists(address pool)",
   "error InvalidSupply(uint256 wholeTokens)",
@@ -147,7 +149,12 @@ export interface LaunchStatus {
   poolTokens: bigint;
   openAt: bigint;
   startTick: bigint;
+  /** Safe communauté : réserve et 60 % des frais. */
   feeRecipient: string;
+  /** Safe de l'équipe : 40 % des frais. */
+  teamFeeRecipient: string;
+  /** Part des frais versée à l'équipe, en % (40). */
+  teamFeePercent: bigint;
   vesting: string;
   vestingTokens: bigint;
   community: string;
@@ -173,12 +180,14 @@ export async function readLaunchStatus(provider: Provider, launcherAddress: stri
     launcher.START_TICK(),
     launcher.FEE_RECIPIENT(),
   ])) as [string, string, string, string, bigint, bigint, bigint, bigint, string];
-  const [vesting, vestingTokens, community, communityTokens] = (await Promise.all([
+  const [vesting, vestingTokens, community, communityTokens, teamFeeRecipient, teamFeePercent] = (await Promise.all([
     launcher.VESTING(),
     launcher.VESTING_TOKENS(),
     launcher.COMMUNITY(),
     launcher.COMMUNITY_TOKENS(),
-  ])) as [string, bigint, string, bigint];
+    launcher.TEAM_FEE_RECIPIENT(),
+    launcher.TEAM_FEE_PERCENT(),
+  ])) as [string, bigint, string, bigint, string, bigint];
   const [walletLimit, state] = await Promise.all([
     new Contract(token, TOKEN_LIMIT_ABI, provider).walletLimit() as Promise<bigint>,
     readPoolStatus(provider, pool, token, weth),
@@ -202,6 +211,8 @@ export async function readLaunchStatus(provider: Provider, launcherAddress: stri
     openAt,
     startTick,
     feeRecipient: getAddress(feeRecipient),
+    teamFeeRecipient: getAddress(teamFeeRecipient),
+    teamFeePercent,
     vesting: getAddress(vesting),
     vestingTokens,
     community: getAddress(community),

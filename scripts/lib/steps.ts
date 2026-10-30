@@ -361,7 +361,7 @@ export function describeRevert(error: unknown): string {
   if (parsed?.name === "InvalidParams") {
     return (
       "le lanceur refuse ses paramètres (heure d'ouverture passée ou à plus de 30 jours, tick de départ, " +
-      "contrat de blocage ou Safe sans code, ou répartition impossible)"
+      "contrat de blocage ou Safe sans code, Safes des frais identiques, ou répartition impossible)"
     );
   }
   if (parsed?.name === "PoolAlreadyExists") {
@@ -389,8 +389,10 @@ export interface LaunchParams extends TokenParams {
   /** Safe communauté (adresse 0 et 0 token = aucune réserve). */
   community: string;
   communityWholeTokens: bigint;
-  /** Reçoit les frais d'échange de la position. */
+  /** Reçoit 60 % des frais d'échange de la position (Safe communauté). */
   feeRecipient: string;
+  /** Reçoit 40 % des frais d'échange de la position (Safe de l'équipe). */
+  teamFeeRecipient: string;
   /** Sel CREATE2 imposé (tests) ; sinon tiré au hasard au moment de signer. */
   salt?: string;
 }
@@ -411,6 +413,7 @@ export function launchParamsOf(token: TokenRecord): LaunchParams {
     community: token.community,
     communityWholeTokens: BigInt(token.communityWholeTokens),
     feeRecipient: token.feeRecipient,
+    teamFeeRecipient: token.teamFeeRecipient,
     salt: token.salt,
   };
 }
@@ -424,17 +427,19 @@ async function launcherMatches(ctx: StepContext, entry: TokenRecord): Promise<bo
   const provider = ctx.ethers.provider;
   if ((await provider.getCode(entry.launcher)) === "0x" || (await provider.getCode(entry.address)) === "0x") return false;
   const launcher = new Contract(entry.launcher, LAUNCHER_ABI, provider);
-  const [tokenAddress, openAt, startTick, feeRecipient] = (await Promise.all([
+  const [tokenAddress, openAt, startTick, feeRecipient, teamFeeRecipient] = (await Promise.all([
     launcher.TOKEN(),
     launcher.OPEN_AT(),
     launcher.START_TICK(),
     launcher.FEE_RECIPIENT(),
-  ])) as [string, bigint, bigint, string];
+    launcher.TEAM_FEE_RECIPIENT(),
+  ])) as [string, bigint, bigint, string, string];
   if (
     getAddress(tokenAddress) !== getAddress(entry.address) ||
     openAt !== BigInt(entry.openAt) ||
     startTick !== BigInt(entry.startTick) ||
-    getAddress(feeRecipient) !== getAddress(entry.feeRecipient)
+    getAddress(feeRecipient) !== getAddress(entry.feeRecipient) ||
+    getAddress(teamFeeRecipient) !== getAddress(entry.teamFeeRecipient)
   ) {
     return false;
   }
@@ -503,6 +508,7 @@ export async function deployTokenStep(ctx: StepContext, params: LaunchParams): P
       community: getAddress(params.community),
       communityWholeTokens: params.communityWholeTokens.toString(),
       feeRecipient: getAddress(params.feeRecipient),
+      teamFeeRecipient: getAddress(params.teamFeeRecipient),
       startTick: params.startTick,
       openAt: params.openAt.toString(),
     };

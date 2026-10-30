@@ -30,9 +30,9 @@ export const launchConfig = {
     // et affiche le prix et la capitalisation réels. 3 ETH ⇒ 0,5 % de l'offre (la limite de
     // la 1re heure) coûte ≈ 0,015 ETH, plus 1 % de frais : un robot paie dès la première
     // seconde un vrai prix.
-    // Les frais d'échange (1 % de chaque achat et revente dans la position) reviennent au
-    // Safe communauté (community.beneficiary) : n'importe qui peut les y envoyer avec
-    // npm run fees:mainnet.
+    // Les frais d'échange (1 % de chaque achat et revente dans la position) sont partagés :
+    // 60 % au Safe communauté (community.beneficiary), 40 % au Safe de l'équipe (team.safe).
+    // N'importe qui peut déclencher le versement avec npm run fees:mainnet.
     startMarketCapEth: "3",
     // Heure d'ouverture des échanges, date ISO en UTC (ex. "2026-12-01T20:00:00Z"), entre le
     // déploiement et 30 jours après (au moins 1 h après sur le mainnet) : laisse le temps de
@@ -48,10 +48,19 @@ export const launchConfig = {
     // Safe 2 sur 3 dédié à la communauté (app.safe.global, réseau Robinhood Chain) :
     // 3 propriétaires (ex. ton Ledger, un 2e wallet, une personne de confiance), 2 signatures
     // pour chaque envoi. Le wallet de déploiement ne doit PAS en être propriétaire.
-    // Il reçoit aussi les frais d'échange du pool. Le Safe doit EXISTER avant npm run deploy:mainnet :
+    // Il reçoit aussi 60 % des frais d'échange du pool. Le Safe doit EXISTER avant npm run deploy:mainnet :
     // le script refuse de déployer si cette adresse n'est pas un vrai Safe (elle est gravée dans
     // le lanceur). Obligatoire. Colle-la avec ses majuscules et minuscules d'origine.
     beneficiary: "",
+  },
+  team: {
+    // Safe 2 sur 3 de l'équipe (app.safe.global, réseau Robinhood Chain), avec les MÊMES 3 clés
+    // que le Safe communauté, mais une adresse différente : il reçoit 40 % des frais d'échange
+    // du pool (le Safe communauté reçoit les 60 % restants). Le wallet de déploiement ne doit PAS
+    // en être propriétaire. Il doit EXISTER avant npm run deploy:mainnet : le script vérifie que
+    // c'est un vrai Safe (son adresse est gravée dans le lanceur). Obligatoire sur le mainnet ;
+    // vide pour la répétition = un Safe d'essai. Colle-la avec ses majuscules et minuscules d'origine.
+    safe: "",
   },
   vesting: {
     // Ta part va dans un contrat de vesting déployé par npm run deploy:mainnet juste AVANT le

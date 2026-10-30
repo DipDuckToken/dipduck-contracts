@@ -42,6 +42,7 @@ async function fixture() {
   const uniswap = await deployLocalUniswapV3(ethers, operator);
   const vesting = await ethers.deployContract("MockSafeSingleton", ["1.4.1"]);
   const community = await ethers.deployContract("MockSafeSingleton", ["1.4.1"]);
+  const team = await ethers.deployContract("MockSafeSingleton", ["1.4.1"]);
   const openAt = BigInt(await networkHelpers.time.latest()) + 3600n;
   return {
     deployer,
@@ -52,6 +53,7 @@ async function fixture() {
     openAt,
     vesting: await vesting.getAddress(),
     community: await community.getAddress(),
+    team: await team.getAddress(),
   };
 }
 
@@ -65,6 +67,7 @@ function configOf(f: Fixture) {
     community: f.community,
     communityTokens: COMMUNITY,
     feeRecipient: f.community,
+    teamFeeRecipient: f.team,
     startTick: START_TICK,
     openAt: f.openAt,
     positionManager: f.uniswap.positionManager,
@@ -184,8 +187,13 @@ for (const tokenIsToken0 of [true, false]) {
       const weth = new Contract(f.uniswap.weth, ERC20_ABI, ethers.provider);
       const before = (await weth.balanceOf(f.community)) as bigint;
       await (await launcher.connect(f.attacker).collectFees()).wait();
-      const wethFees = ((await weth.balanceOf(f.community)) as bigint) - before;
-      expect(wethFees > 0n && wethFees < parseEther("0.0102") + 1n).to.equal(true); // 1 % des achats
+      const communityFees = ((await weth.balanceOf(f.community)) as bigint) - before;
+      const teamFees = (await weth.balanceOf(f.team)) as bigint;
+      const total = communityFees + teamFees;
+      expect(total > 0n && total < parseEther("0.0102") + 1n).to.equal(true); // 1 % des achats
+      expect(teamFees).to.equal((total * 40n) / 100n); // 40 % équipe, 60 % communauté
+      expect((await token.balanceOf(f.team)) > 0n).to.equal(true); // frais en tokens partagés aussi
+      expect(await token.balanceOf(await launcher.getAddress())).to.equal(0n);
     });
   });
 }
@@ -221,6 +229,8 @@ describe("Lancement Uniswap v3 : pool impossible à piéger", function () {
       { ...configOf(f), vesting: f.alice.address },
       { ...configOf(f), community: f.vesting },
       { ...configOf(f), feeRecipient: "0x0000000000000000000000000000000000000000" },
+      { ...configOf(f), teamFeeRecipient: f.alice.address },
+      { ...configOf(f), teamFeeRecipient: f.community },
       { ...configOf(f), vestingTokens: SUPPLY },
       { ...configOf(f), positionManager: f.alice.address },
     ];

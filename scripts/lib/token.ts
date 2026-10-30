@@ -55,7 +55,7 @@ export function gameConstructorArgs(
 }
 
 /** Paramètres de LaunchPool.Config, dans l'ordre du contrat (montants de tokens en tokens entiers). */
-export type LaunchConfigTuple = [bigint, string, bigint, string, bigint, string, number, bigint, string];
+export type LaunchConfigTuple = [bigint, string, bigint, string, bigint, string, string, number, bigint, string];
 
 type LaunchFields = Pick<
   TokenRecord,
@@ -67,6 +67,7 @@ type LaunchFields = Pick<
   | "community"
   | "communityWholeTokens"
   | "feeRecipient"
+  | "teamFeeRecipient"
   | "startTick"
   | "openAt"
   | "positionManager"
@@ -75,7 +76,7 @@ type LaunchFields = Pick<
 
 /**
  * Arguments du constructeur de LaunchPool : nom, symbole, Config (offre, blocage et sa part,
- * Safe communauté et sa réserve, destinataire des frais, tick de départ, ouverture,
+ * Safe communauté et sa réserve, Safe communauté et Safe équipe pour les frais, tick de départ, ouverture,
  * gestionnaire de positions), puis le sel CREATE2 du token.
  */
 export function launcherConstructorArgs(token: LaunchFields): [string, string, LaunchConfigTuple, string] {
@@ -89,6 +90,7 @@ export function launcherConstructorArgs(token: LaunchFields): [string, string, L
       token.community,
       BigInt(token.communityWholeTokens),
       token.feeRecipient,
+      token.teamFeeRecipient,
       token.startTick,
       BigInt(token.openAt),
       token.positionManager,

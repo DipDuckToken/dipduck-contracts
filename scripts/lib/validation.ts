@@ -288,6 +288,49 @@ export function validateCommunityParams(
   return { percent: BigInt(params.percent), beneficiary };
 }
 
+/** Section `team` de launch.config.ts. */
+export interface TeamParams {
+  /** Safe 2 sur 3 de l'équipe : reçoit 40 % des frais d'échange du pool. */
+  safe: string;
+}
+
+/**
+ * Safe de l'équipe (40 % des frais d'échange du pool) : obligatoire, avec sa casse
+ * d'origine, ni 0 ni l'adresse morte, différent du wallet de déploiement et du Safe
+ * communauté (le contrat refuse deux fois le même). Le contrôle « vrai Safe » demande
+ * la chaîne : il est fait par le script de déploiement.
+ */
+export function validateTeamParams(params: TeamParams, deployer: string, communitySafe: string | undefined): string {
+  const problems: string[] = [];
+  const requested = params.safe.trim();
+  let safe: string | undefined;
+  if (requested === "") {
+    problems.push(
+      "team.safe est obligatoire : le Safe de l'équipe (2 sur 3, mêmes 3 clés que le Safe communauté) reçoit " +
+        "40 % des frais d'échange du pool",
+    );
+  } else {
+    try {
+      safe = getAddress(requested);
+      if (!hasChecksumCase(requested)) {
+        problems.push("team.safe doit être recopiée avec ses majuscules et minuscules d'origine (copie-la depuis app.safe.global)");
+      } else if (safe === ZeroAddress || safe === getAddress(DEAD_ADDRESS)) {
+        problems.push("team.safe ne peut être ni l'adresse 0 ni l'adresse morte : les frais seraient perdus");
+      } else if (safe === getAddress(deployer)) {
+        problems.push("team.safe ne peut pas être le wallet de déploiement : utilise le Safe 2 sur 3 de l'équipe");
+      } else if (communitySafe !== undefined && safe === getAddress(communitySafe)) {
+        problems.push("team.safe doit être différent du Safe communauté (community.beneficiary) : deux Safes distincts");
+      }
+    } catch {
+      problems.push(`team.safe n'est pas une adresse valide (ou sa casse est fausse) : "${requested}"`);
+    }
+  }
+  if (problems.length > 0) {
+    throw new LaunchError(`Paramètres du Safe de l'équipe invalides :\n  - ${problems.join("\n  - ")}`);
+  }
+  return safe as string;
+}
+
 /**
  * `requireSeparateWallet` (mainnet) : la part bloquée doit aller à un wallet fondateur
  * à part (Ledger), jamais au wallet de déploiement dont la clé est sur le PC.

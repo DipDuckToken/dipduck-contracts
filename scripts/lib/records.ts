@@ -64,8 +64,10 @@ export interface TokenRecord extends JournaledTx {
   /** Safe communauté qui reçoit la réserve au déploiement (adresse 0 = aucune). */
   community: string;
   communityWholeTokens: string;
-  /** Reçoit les frais d'échange de la position (le Safe communauté). */
+  /** Reçoit 60 % des frais d'échange de la position (le Safe communauté). */
   feeRecipient: string;
+  /** Reçoit 40 % des frais d'échange de la position (le Safe de l'équipe). */
+  teamFeeRecipient: string;
   /** Prix de départ en tick « WETH par token », multiple de 200. */
   startTick: number;
   /** Horodatage Unix (s) de l'ouverture des échanges. */

@@ -82,7 +82,9 @@ await runScript(async () => {
     launch.pendingFees === undefined
       ? "illisibles pour l'instant (pendant les 24 h, le Safe peut dépasser la limite : réessaie après)"
       : `${formatEth(launch.pendingFees.weth)} et ${formatTokenAmount(launch.pendingFees.tokens)} ${symbol}` +
-          (launch.pendingFees.weth > 0n || launch.pendingFees.tokens > 0n ? ` — npm run fees:${step} les verse au Safe` : ""),
+          (launch.pendingFees.weth > 0n || launch.pendingFees.tokens > 0n
+            ? ` — npm run fees:${step} les partage (${100n - launch.teamFeePercent} % communauté, ${launch.teamFeePercent} % équipe)`
+            : ""),
   );
   row("Explorateur (pool)", explorerLink(profile, "address", launch.pool) ?? "—");
 
@@ -107,15 +109,22 @@ await runScript(async () => {
     }
   }
 
-  heading("Safe communauté");
-  row("Adresse", launch.feeRecipient);
-  if (launch.communityTokens > 0n) {
-    row("Réserve versée au lancement", `${formatTokenAmount(launch.communityTokens)} ${symbol} (${percent(launch.communityTokens, totalSupply)})`);
+  const teamPercent = launch.teamFeePercent;
+  for (const [title, address, share] of [
+    ["Safe communauté", launch.feeRecipient, 100n - teamPercent],
+    ["Safe de l'équipe", launch.teamFeeRecipient, teamPercent],
+  ] as const) {
+    heading(title);
+    row("Adresse", address);
+    row("Part des frais du pool", `${share} %`);
+    if (address === launch.feeRecipient && launch.communityTokens > 0n) {
+      row("Réserve versée au lancement", `${formatTokenAmount(launch.communityTokens)} ${symbol} (${percent(launch.communityTokens, totalSupply)})`);
+    }
+    const [safeTokens, safeWeth] = await Promise.all([
+      tokenBalance(ethers.provider, record.token.address, address),
+      tokenBalance(ethers.provider, launch.weth, address),
+    ]);
+    row("Solde actuel", `${formatTokenAmount(safeTokens)} ${symbol} et ${formatEth(safeWeth)} de WETH`);
+    row("Explorateur", explorerLink(profile, "address", address) ?? "—");
   }
-  const [safeTokens, safeWeth] = await Promise.all([
-    tokenBalance(ethers.provider, record.token.address, launch.feeRecipient),
-    tokenBalance(ethers.provider, launch.weth, launch.feeRecipient),
-  ]);
-  row("Solde actuel", `${formatTokenAmount(safeTokens)} ${symbol} et ${formatEth(safeWeth)} de WETH (frais reçus)`);
-  row("Explorateur", explorerLink(profile, "address", launch.feeRecipient) ?? "—");
 });

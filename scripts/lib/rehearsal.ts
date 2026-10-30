@@ -20,8 +20,10 @@ export interface RehearsalReport {
   plan: LaunchPlan;
   /** Contrat de blocage déployé avant le lanceur (absent sans part gardée). */
   vestingRecord?: VestingRecord;
-  /** Safe communauté (réserve et frais) ; `fakeSafe` = Safe d'essai déployé sur la copie locale. */
+  /** Safe communauté (réserve et 60 % des frais) ; `fakeSafe` = Safe d'essai déployé sur la copie locale. */
   communitySafe: { address: string; fakeSafe: boolean };
+  /** Safe de l'équipe (40 % des frais). */
+  teamSafe: { address: string; fakeSafe: boolean };
   gasUsed: { vesting: bigint; launcher: bigint };
   /** Répartition lue sur la chaîne juste après le déploiement. */
   distribution: { inPool: bigint; inVesting: bigint; inCommunity: bigint; deployer: bigint; positionHeldByLauncher: boolean };
@@ -35,7 +37,8 @@ export interface RehearsalReport {
   };
   smallBuys: { buyers: number; ethIn: bigint; tokensOut: bigint };
   resale: { tokensIn: bigint; ethOut: bigint };
-  fees: { weth: bigint; tokens: bigint };
+  /** Frais versés par collectFees, et la part reçue par chaque Safe. */
+  fees: { weth: bigint; tokens: bigint; teamWeth: bigint; teamTokens: bigint; communityWeth: bigint; communityTokens: bigint };
   status: LaunchStatus;
   /** Présent quand une part est gardée : versée au bénéficiaire en avançant le temps. */
   vesting?: {
@@ -63,7 +66,15 @@ async function gasUsedBy(ethers: HardhatEthers, txHash: string | undefined): Pro
 export async function runRehearsal(
   connection: NetworkConnection,
   uniswap: UniswapV3Deployment,
-  input: { token: TokenParams; pool: ValidatedPool; vestingPercent: bigint; vesting?: ValidatedVesting; community?: ValidatedCommunity },
+  input: {
+    token: TokenParams;
+    pool: ValidatedPool;
+    vestingPercent: bigint;
+    vesting?: ValidatedVesting;
+    community?: ValidatedCommunity;
+    /** Safe de l'équipe ; absent = un Safe d'essai sur la copie locale. */
+    teamSafe?: string;
+  },
   log: (message: string) => void = () => {},
 ): Promise<RehearsalReport> {
   const { ethers, networkHelpers } = connection;
@@ -107,22 +118,29 @@ export async function runRehearsal(
     });
   }
 
-  // 2. Le Safe communauté (réserve et frais) doit exister avant : un Safe d'essai si aucun n'est donné.
-  let safeAddress = input.community?.beneficiary;
-  let fakeSafe = false;
-  if (safeAddress === undefined) {
-    log("Pas de Safe communauté dans la config : déploiement d'un Safe d'essai 2 sur 3 (copie locale seulement)…");
+  // 2. Les deux Safes (communauté : réserve et 60 % des frais ; équipe : 40 % des frais) doivent
+  //    exister avant : des Safes d'essai 2 sur 3 (mêmes 3 clés) si aucun n'est donné.
+  const safeOrFake = async (given: string | undefined, label: string) => {
+    if (given !== undefined) {
+      await assertSafe(ethers.provider, given, deployer.address, label);
+      return { address: getAddress(given), fakeSafe: false };
+    }
+    log(`${label} absent de la config : déploiement d'un Safe d'essai 2 sur 3 (copie locale seulement)…`);
     const singleton = await ethers.deployContract("MockSafeSingleton", ["1.4.1"], extra(10));
     const safe = await ethers.deployContract(
       "MockSafe",
       [await singleton.getAddress(), [extra(10).address, extra(11).address, extra(12).address], 2],
       extra(10),
     );
-    safeAddress = await safe.getAddress();
-    fakeSafe = true;
+    const address = await safe.getAddress();
+    await assertSafe(ethers.provider, address, deployer.address, label);
+    return { address: getAddress(address), fakeSafe: true };
+  };
+  const communitySafe = await safeOrFake(input.community?.beneficiary, "Le Safe communauté");
+  const teamSafe = await safeOrFake(input.teamSafe, "Le Safe de l'équipe");
+  if (teamSafe.address === communitySafe.address) {
+    throw new LaunchError("Le Safe de l'équipe doit être différent du Safe communauté.");
   }
-  await assertSafe(ethers.provider, safeAddress, deployer.address, "Le wallet communauté");
-  const communitySafe = { address: getAddress(safeAddress), fakeSafe };
 
   // 3. Le lanceur : token, part, réserve, pool et position d'un seul côté.
   const positionManager = new Contract(uniswap.positionManager, V3_POSITION_MANAGER_ABI, ethers.provider);
@@ -138,6 +156,7 @@ export async function runRehearsal(
     community: split.communityWholeTokens > 0n ? communitySafe.address : ZeroAddress,
     communityWholeTokens: split.communityWholeTokens,
     feeRecipient: communitySafe.address,
+    teamFeeRecipient: teamSafe.address,
   });
   const tokenContract = new Contract(token.address, ERC20_ABI, ethers.provider);
   const balanceOf = async (holder: string) => (await tokenContract.balanceOf(holder)) as bigint;
@@ -230,22 +249,41 @@ export async function runRehearsal(
     throw new LaunchError(`Gros achat inattendu : ${bigOut} reçus pour ${bigExpected} annoncés.`);
   }
 
-  // 9. Les frais d'échange (1 %) vont au Safe, appelés par n'importe qui.
-  log("Versement des frais d'échange au Safe (appelé par un inconnu)…");
+  // 9. Les frais d'échange (1 %) sont partagés 60/40 entre les deux Safes, par n'importe qui.
+  log("Partage des frais d'échange entre les deux Safes (appelé par un inconnu)…");
   const weth = new Contract(launched.weth, ERC20_ABI, ethers.provider);
-  const safeWethBefore = (await weth.balanceOf(communitySafe.address)) as bigint;
-  const safeTokensBefore = await balanceOf(communitySafe.address);
+  const wethOf = async (holder: string) => (await weth.balanceOf(holder)) as bigint;
+  const before = {
+    communityWeth: await wethOf(communitySafe.address),
+    communityTokens: await balanceOf(communitySafe.address),
+    teamWeth: await wethOf(teamSafe.address),
+    teamTokens: await balanceOf(teamSafe.address),
+  };
   const feeReceipt = (await (await new Contract(token.launcher, LAUNCHER_ABI, extra(9)).collectFees()).wait()) as TransactionReceipt | null;
   const collected = feeReceipt?.logs
     .filter((entry) => getAddress(entry.address) === getAddress(token.launcher))
     .map((entry) => launcherInterface.parseLog({ topics: [...entry.topics], data: entry.data }))
     .find((parsed) => parsed?.name === "FeesCollected");
+  const communityWeth = (await wethOf(communitySafe.address)) - before.communityWeth;
+  const communityTokens = (await balanceOf(communitySafe.address)) - before.communityTokens;
+  const teamWeth = (await wethOf(teamSafe.address)) - before.teamWeth;
+  const teamTokens = (await balanceOf(teamSafe.address)) - before.teamTokens;
   const fees = {
-    weth: ((await weth.balanceOf(communitySafe.address)) as bigint) - safeWethBefore,
-    tokens: (await balanceOf(communitySafe.address)) - safeTokensBefore,
+    weth: communityWeth + teamWeth,
+    tokens: communityTokens + teamTokens,
+    teamWeth,
+    teamTokens,
+    communityWeth,
+    communityTokens,
   };
-  if (collected === undefined || fees.weth <= 0n) {
-    throw new LaunchError("Les frais d'échange n'ont pas été versés au Safe.");
+  const teamPercent = launched.teamFeePercent;
+  if (
+    collected === undefined ||
+    fees.weth <= 0n ||
+    teamWeth !== (fees.weth * teamPercent) / 100n ||
+    teamTokens !== (fees.tokens * teamPercent) / 100n
+  ) {
+    throw new LaunchError(`Les frais d'échange n'ont pas été partagés ${100n - teamPercent} / ${teamPercent} entre les deux Safes.`);
   }
 
   const status = await readLaunchStatus(ethers.provider, token.launcher);
@@ -279,6 +317,7 @@ export async function runRehearsal(
     plan,
     vestingRecord,
     communitySafe,
+    teamSafe,
     gasUsed: {
       vesting: await gasUsedBy(ethers, vestingRecord?.txHash),
       launcher: await gasUsedBy(ethers, token.txHash),

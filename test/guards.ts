@@ -18,6 +18,7 @@ import {
   parseIsoDate,
   validateCommunityParams,
   validatePoolParams,
+  validateTeamParams,
   validateTokenParams,
   validateVestingParams,
   validateVestingPercent,
@@ -246,6 +247,26 @@ describe("Réserve communauté", function () {
     expectInvalid(() => validateCommunityParams({ ...valid, beneficiary: "0x1234" }, deployer, 10n), /pas une adresse valide/);
   });
 
+});
+
+describe("Safe de l'équipe (40 % des frais du pool)", function () {
+  const deployer = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+  const community = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
+  const team = "0x90F79bf6EB2c4f870365E785982E1f101E93b906";
+
+  it("accepte un Safe dédié et le rend avec sa somme de contrôle", function () {
+    expect(validateTeamParams({ safe: ` ${team} ` }, deployer, community)).to.equal(team);
+  });
+
+  it("refuse un Safe vide, sans casse, nul, mort, le wallet de déploiement ou le Safe communauté", function () {
+    expectInvalid(() => validateTeamParams({ safe: "" }, deployer, community), /team.safe est obligatoire/);
+    expectInvalid(() => validateTeamParams({ safe: team.toLowerCase() }, deployer, community), /majuscules/);
+    expectInvalid(() => validateTeamParams({ safe: "0x0000000000000000000000000000000000000000" }, deployer, community), /adresse 0/);
+    expectInvalid(() => validateTeamParams({ safe: "0x000000000000000000000000000000000000dEaD" }, deployer, community), /adresse morte/);
+    expectInvalid(() => validateTeamParams({ safe: deployer }, deployer, community), /wallet de déploiement/);
+    expectInvalid(() => validateTeamParams({ safe: community }, deployer, community), /différent du Safe communauté/);
+    expectInvalid(() => validateTeamParams({ safe: "0x1234" }, deployer, community), /pas une adresse valide/);
+  });
 });
 
 describe("Paramètres du blocage (vesting)", function () {
