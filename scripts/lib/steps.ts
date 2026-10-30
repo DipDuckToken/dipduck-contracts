@@ -1107,12 +1107,13 @@ export const GAME_ABI = [
 export const FEED_ABI = [
   "function decimals() view returns (uint8)",
   "function latestRoundData() view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)",
+  "function getRoundData(uint80 roundId) view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)",
 ] as const;
 
 /** Constantes attendues du contrat de jeu. */
 export const GAME_DATA_START = 1282089600n;
 export const GAME_TOP_SIZE = 50n;
-/** Âge maximal du prix accepté par recordDay (MAX_STALE du contrat). */
+/** Au-delà de cet âge, le dernier prix du flux est signalé (recordDay attend un round après minuit). */
 export const GAME_MAX_STALE_SECONDS = 26n * 3600n;
 
 /** État du flux de prix : refuse un flux sans code, muet, à prix nul ou qui n'a pas 8 décimales. */
@@ -1127,9 +1128,12 @@ export async function checkFeed(ctx: StepContext, feed: string): Promise<{ price
   let updatedAt: bigint;
   try {
     decimals = (await aggregator.decimals()) as bigint;
-    [, answer, , updatedAt] = (await aggregator.latestRoundData()) as [bigint, bigint, bigint, bigint, bigint];
+    let roundId: bigint;
+    [roundId, answer, , updatedAt] = (await aggregator.latestRoundData()) as [bigint, bigint, bigint, bigint, bigint];
+    // recordDay relit l'historique : getRoundData doit répondre pour le dernier round.
+    await aggregator.getRoundData(roundId);
   } catch {
-    throw new LaunchError(`Le contrat ${feed} ne répond pas comme un flux Chainlink (decimals, latestRoundData). Rien n'a été envoyé.`);
+    throw new LaunchError(`Le contrat ${feed} ne répond pas comme un flux Chainlink (decimals, latestRoundData, getRoundData). Rien n'a été envoyé.`);
   }
   if (decimals !== 8n) throw new LaunchError(`Le flux ${feed} a ${decimals} décimales, 8 attendues (BTC/USD). Rien n'a été envoyé.`);
   if (answer <= 0n) throw new LaunchError(`Le flux ${feed} donne un prix nul ou négatif. Rien n'a été envoyé.`);

@@ -106,7 +106,7 @@ async function deployGame(connection: NetworkConnection, profile: NetworkProfile
     row("Temps minimal", `${genesis.histMinSeconds.length} tranches, ${genesis.histMinSeconds.at(-1)} s au dernier jour fourni`);
     row("Flux BTC/USD", `${feed} — ${Number(price) / 1e8} USD, il y a ${ageSeconds} s`);
     if (ageSeconds > GAME_MAX_STALE_SECONDS) {
-      console.log("  ⚠ Ce prix a plus de 26 h : startRun et recordDay seront refusés (StalePrice) tant qu'il n'est pas mis à jour.");
+      console.log("  ⚠ Ce prix a plus de 26 h : recordDay attendra un nouveau round (startRun, lui, ne lit aucun prix).");
     }
     row("Concours", "un par trimestre civil UTC, top 50 : le plus loin, puis baisses, pièces, score, le plus ancien");
     row("Reste possible", "un programme qui joue vraiment, en temps réel");

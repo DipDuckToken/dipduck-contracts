@@ -29,7 +29,8 @@ const GAME_ABI = [
   "function minTimeFor(uint32 day) view returns (uint256)",
   "function currentContest() view returns (uint32 id, uint64 startTs, uint64 endTs, uint32 finishDay)",
   "function verify(uint32[] taps, uint32 finishDay) view returns (uint32 day, uint32 caught, uint32 coins, uint32 score, uint32 finalX)",
-  "function recordDay()",
+  "function recordDay(uint80[] roundIds)",
+  "function daysBehind() view returns (uint256)",
   "function startRun()",
   "function runOf(address player) view returns (uint64 start, uint32 contest)",
   "function contestFinishDay(uint32 id) view returns (uint32)",
@@ -37,6 +38,53 @@ const GAME_ABI = [
   "function best(uint32 contest, address player) view returns (uint32 day, uint32 caught, uint32 coins, uint32 score, bytes32 nickname, uint64 at)",
   "function topCount(uint32 contest) view returns (uint256)",
 ];
+
+const FEED_ABI = [
+  "function setAnswer(int256 answer, uint256 updatedAt)",
+  "function latestRound() view returns (uint80)",
+];
+const DATA_START = 1282089600n;
+const DAY = 86400n;
+
+/** Jour du jeu de l'horloge de la chaîne. */
+async function today(): Promise<bigint> {
+  return (BigInt(await networkHelpers.time.latest()) - DATA_START) / DAY;
+}
+
+/**
+ * Publie sur le flux d'essai un round par jour, des jours `from` à `to` inclus (à 0 h 00 min 01 s
+ * UTC), au prix `price`. Renvoie le round de chaque jour : c'est sa clôture officielle.
+ */
+async function publishRounds(feedAddress: string, from: bigint, to: bigint, price = 7_000_000_000_000n): Promise<Map<bigint, bigint>> {
+  const [signer] = await ethers.getSigners();
+  const feed = new Contract(feedAddress, FEED_ABI, signer);
+  const ids = new Map<bigint, bigint>();
+  for (let d = from; d <= to; d += 1n) {
+    await (await feed.setAnswer(price, DATA_START + d * DAY + 1n)).wait();
+    ids.set(d, (await feed.latestRound()) as bigint);
+  }
+  return ids;
+}
+
+/** Enregistre jusqu'au jour `to` inclus, 60 jours au plus par appel ; renvoie le gas de chaque appel. */
+async function recordUpTo(game: Contract, ids: Map<bigint, bigint>, to: bigint): Promise<bigint[]> {
+  const gas: bigint[] = [];
+  for (;;) {
+    const last = (await game.lastRecordedDay()) as bigint;
+    if (last >= to) return gas;
+    const count = to - last > 60n ? 60n : to - last;
+    const batch = Array.from({ length: Number(count) }, (_, i) => ids.get(last + 1n + BigInt(i)) as bigint);
+    gas.push(((await (await game.recordDay(batch)).wait())?.gasUsed ?? 0n) as bigint);
+  }
+}
+
+/** Publie les rounds manquants (jusqu'à aujourd'hui) et enregistre tous les jours terminés. */
+async function catchUp(game: Contract, feedAddress: string): Promise<void> {
+  const now = await today();
+  const last = (await game.lastRecordedDay()) as bigint;
+  if (last + 1n >= now) return;
+  await recordUpTo(game, await publishRounds(feedAddress, last + 1n, now), now - 1n);
+}
 
 /** La promesse doit échouer avec une LaunchError. */
 async function expectLaunchError(promise: Promise<unknown>): Promise<void> {
@@ -192,7 +240,9 @@ describe("Jeu « Attrape la baisse » : genèse, déploiement journalisé et par
     expect(await game.dipAt(3)).to.deep.equal([300n, 5n]);
     expect(await game.lastRecordedDay()).to.equal(5913n);
 
-    // Partie parfaite : enregistre les jours écoulés, concours du trimestre courant.
+    // Partie parfaite : les jours terminés sont enregistrés d'abord (startRun ne lit aucun prix).
+    await catchUp(game, feed);
+    expect(await game.daysBehind()).to.equal(0n);
     await (await game.startRun()).wait();
     const [, contest] = (await game.runOf(signer.address)) as [bigint, bigint];
     const finishDay = (await game.contestFinishDay(contest)) as bigint;
@@ -239,21 +289,24 @@ describe("Jeu « Attrape la baisse » : genèse, déploiement journalisé et par
     expect([day, caught, got, finalX]).to.deep.equal([5872n, 125n, 185n, 5872n * 12n]);
   });
 
-  it("rattrape 200 jours de retard en 4 appels de recordDay plafonnés", async function () {
+  it("rattrape 200 jours de retard en 4 appels de recordDay plafonnés, avec le vrai prix de chaque jour", async function () {
     const file = resolveGenesisPath(launchConfig.game.genesisFile);
     const genesis = existsSync(file) ? await loadGenesisFile(file) : validateGenesis(sampleJson());
-    const record = await deployGameStep(await context(), genesis, await mockFeed());
+    const feed = await mockFeed();
+    const record = await deployGameStep(await context(), genesis, feed);
     const [signer] = await ethers.getSigners();
-    const game = new Contract(record.address, [...GAME_ABI, "function daysBehind() view returns (uint256)"], signer);
+    const game = new Contract(record.address, GAME_ABI, signer);
     const behind = (await game.daysBehind()) as bigint;
-    await networkHelpers.time.increase((200n - behind) * 86400n);
+    await networkHelpers.time.increase((200n - behind) * DAY);
     expect(await game.daysBehind()).to.equal(200n);
-    const gas: bigint[] = [];
-    for (let k = 0; k < 4; k += 1) gas.push(((await (await game.recordDay()).wait())?.gasUsed ?? 0n) as bigint);
+    const last = (await game.lastRecordedDay()) as bigint;
+    const ids = await publishRounds(feed, last + 1n, last + 201n);
+    const gas = await recordUpTo(game, ids, last + 200n);
+    expect(gas).to.have.length(4);
     expect(await game.daysBehind()).to.equal(0n);
     const max = gas.reduce((a, b) => (a > b ? a : b));
-    expect(max < 3_000_000n).to.equal(true);
-    console.log(`      recordDay plafonné (60 jours + évaluations) : ${gas.join(", ")} gas`);
+    expect(max < 4_000_000n).to.equal(true);
+    console.log(`      recordDay plafonné (60 jours, 2 lectures du flux par jour, évaluations) : ${gas.join(", ")} gas`);
   });
 
   it("déploie la vraie genèse du site (launch.config.ts) et mesure le gas", async function () {
@@ -267,14 +320,14 @@ describe("Jeu « Attrape la baisse » : genèse, déploiement journalisé et par
     expect(await game.priceAt(genesis.detectFrom + 13)).to.equal(genesis.recentPrices[58]);
     const deployReceipt = await ethers.provider.getTransactionReceipt(record.txHash);
 
-    // Jour suivant le dernier jour fourni, puis un jour de plus (avec la 1re évaluation).
-    // Le test précédent a avancé l'horloge : rattrapage (60 jours par appel), puis un jour seul.
-    const behind = new Contract(record.address, ["function daysBehind() view returns (uint256)"], signer);
-    while (((await behind.daysBehind()) as bigint) > 1n) await (await game.recordDay()).wait();
-    if (((await behind.daysBehind()) as bigint) === 0n) await networkHelpers.time.increase(86400);
-    const record1 = await (await game.recordDay()).wait();
-    await networkHelpers.time.increase(86400);
-    const record2 = await (await game.recordDay()).wait();
+    // Rattrapage jusqu'à avant-hier (60 jours par appel), puis un jour seul, puis le dernier jour
+    // terminé (avec une évaluation). Le test précédent a avancé l'horloge.
+    if (((await game.daysBehind()) as bigint) < 2n) await networkHelpers.time.increase(2n * DAY);
+    const now = await today();
+    const ids = await publishRounds((await game.FEED()) as string, ((await game.lastRecordedDay()) as bigint) + 1n, now);
+    await recordUpTo(game, ids, now - 3n);
+    const [record1] = await recordUpTo(game, ids, now - 2n);
+    const [record2] = await recordUpTo(game, ids, now - 1n);
     const start = await (await game.startRun()).wait();
 
     const [, contest] = (await game.runOf(signer.address)) as [bigint, bigint];
@@ -288,8 +341,8 @@ describe("Jeu « Attrape la baisse » : genèse, déploiement journalisé et par
     await networkHelpers.time.increase((await game.minTimeFor(day)) as bigint);
     const submit = await (await game.submit(taps, encodeBytes32String("Gas"))).wait();
     console.log(
-      `      déploiement ${deployReceipt?.gasUsed} ; recordDay 1 jour ${record1?.gasUsed}, ` +
-        `1 jour + évaluation ${record2?.gasUsed} ; startRun ${start?.gasUsed} ; ` +
+      `      déploiement ${deployReceipt?.gasUsed} ; recordDay 1 jour ${record1}, ` +
+        `1 jour + évaluation ${record2} ; startRun ${start?.gasUsed} ; ` +
         `submit ${submit?.gasUsed} (${counted} baisses, ${coins} pièces, ${taps.length} touches)`,
     );
   });

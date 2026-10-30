@@ -7,13 +7,18 @@ interface IAggregatorV3 {
         external
         view
         returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+
+    function getRoundData(uint80 roundId)
+        external
+        view
+        returns (uint80 id, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
 }
 
 /// @title DipDuckGame
 /// @notice Jeu « Attrape la baisse » du site Dip Duck, pour toujours : le canard glisse sur la
 ///         courbe du Bitcoin depuis 2010. L'historique est figé au déploiement, puis la chaîne
-///         ajoute elle-même un prix par jour (flux Chainlink BTC/USD) et y détecte les nouvelles
-///         baisses avec une règle fixe. Un concours par trimestre civil UTC, automatique : le
+///         ajoute un prix par jour TERMINÉ (clôture officielle du flux Chainlink BTC/USD) et y
+///         détecte les nouvelles baisses avec une règle fixe. Un concours par trimestre civil UTC, automatique : le
 ///         gagnant va le plus loin, puis attrape le plus de baisses, puis ramasse le plus de
 ///         pièces, puis marque le plus de points ; à égalité, le plus ancien. Pour le plaisir :
 ///         aucune récompense, aucune valeur. Non affilié à Robinhood.
@@ -24,7 +29,18 @@ interface IAggregatorV3 {
 ///      pixels) et le contrat REJOUE la partie avec les règles entières du site (`verify`).
 ///      `startRun` note l'heure de départ et le concours ; `submit` refuse une partie plus rapide
 ///      que le vrai jeu (`minTimeFor`) ou plus vieille que MAX_RUN. Reste possible : un programme
-///      qui joue vraiment, en temps réel.
+///      qui joue vraiment, en temps réel. La course ne contient que des jours passés : une
+///      partie parfaite est calculable hors ligne (risque résiduel, équivalent au programme).
+///
+///      Prix décalé : `recordDay` n'enregistre que des jours UTC terminés (avant aujourd'hui).
+///      Le prix du jour d est la clôture officielle : la réponse du round Chainlink r fourni par
+///      l'appelant, vérifiée avec `getRoundData` : updatedAt(r) <= minuit de fin du jour d et
+///      updatedAt(round suivant) > minuit. Le round suivant est r + 1 dans la même phase
+///      (roundId = phaseId << 64 | numéro dans l'agrégateur) ; si r + 1 n'existe pas, on essaie
+///      le premier round de la phase suivante ((phaseId + 1) << 64 | 1), cas d'un changement
+///      d'agrégateur juste après r. Tant qu'aucun round suivant n'existe, le jour est refusé
+///      (DayNotFinal) : un seul round convient pour chaque jour, l'appelant ne choisit rien.
+///      Une panne du flux ne bloque pas le jeu : `startRun` ne lit aucun prix.
 ///
 ///      Données : baisses historiques et table des temps minimaux historiques dans le code d'un
 ///      petit contrat de données créé par le constructeur (premier octet 0x00 = STOP, rien
@@ -77,8 +93,6 @@ contract DipDuckGame {
     uint256 public constant TOP_SIZE = 50;
     /// @notice La course d'un concours s'arrête FINISH_LAG + 1 jours avant le début de son trimestre.
     uint256 public constant FINISH_LAG = 15;
-    /// @notice Âge maximal du prix Chainlink accepté par `recordDay`.
-    uint256 public constant MAX_STALE = 26 hours;
     /// @notice Largeur (en jours) d'une tranche de la table historique des temps minimaux.
     uint256 public constant MIN_TIME_BUCKET_DAYS = 30;
     /// @notice Jours enregistrés au plus par appel de `recordDay` (gas borné) ; le retard
@@ -181,7 +195,10 @@ contract DipDuckGame {
     );
 
     error InvalidGenesis();
-    error StalePrice();
+    error InvalidRounds();
+    error BadRound(uint32 day);
+    error DayNotFinal(uint32 day);
+    error DataBehind();
     error ContestNotReady();
     error InvalidTaps();
     error NoRun();
@@ -261,34 +278,33 @@ contract DipDuckGame {
 
     // --- Prix et baisses -------------------------------------------------------------------
 
-    /// @notice Enregistre le prix Chainlink pour les jours écoulés depuis le dernier jour
-    ///         enregistré (remplissage plat), au plus MAX_DAYS_PER_CALL par appel, évalue les
-    ///         jours devenus évaluables et met à jour le temps minimal. N'importe qui peut
-    ///         l'appeler (à répéter tant que `daysBehind()` > 0) ; `startRun` l'appelle aussi.
-    ///         Rien à faire si le jour courant est déjà enregistré (le flux n'est pas lu).
-    function recordDay() public {
-        uint256 today = (block.timestamp - DATA_START) / 1 days;
+    /// @notice Enregistre la clôture officielle des jours lastRecordedDay() + 1 … + roundIds.length
+    ///         (un round Chainlink par jour, voir `closeOf`), au plus MAX_DAYS_PER_CALL jours et
+    ///         seulement des jours terminés, évalue les jours devenus évaluables et met à jour le
+    ///         temps minimal. N'importe qui peut l'appeler ; le site calcule les rounds.
+    function recordDay(uint80[] calldata roundIds) external {
+        uint256 n = roundIds.length;
         State memory st = _state;
         uint256 last = st.lastRecorded;
-        if (today <= last) return;
-        (, int256 answer,, uint256 updatedAt,) = IAggregatorV3(FEED).latestRoundData();
-        if (answer <= 0 || uint256(answer) > MASK64 || updatedAt < block.timestamp - MAX_STALE) revert StalePrice();
-        uint256 price = uint256(answer);
+        uint256 today = (block.timestamp - DATA_START) / 1 days;
+        if (n == 0 || n > MAX_DAYS_PER_CALL || last + n >= today) revert InvalidRounds();
 
         uint256 lastHist = uint256(DETECT_FROM) + RECENT_AFTER;
         uint256 sum = last > lastHist ? _readPacked(_cumul, last) : 0;
         uint256 prev = _readPacked(_prices, last);
-        if (today > last + MAX_DAYS_PER_CALL) today = last + MAX_DAYS_PER_CALL; // travail borné
-        for (uint256 d = last + 1; d <= today; ++d) {
+        for (uint256 i; i < n; ++i) {
+            uint256 d = last + 1 + i;
+            uint256 price = _closeOf(d, roundIds[i]);
             _writePacked(_prices, d, price);
             emit DayRecorded(uint32(d), uint64(price));
             sum += _microsFor(prev, price, d);
             _writePacked(_cumul, d, sum);
             prev = price;
         }
-        st.lastRecorded = uint32(today);
+        last += n;
+        st.lastRecorded = uint32(last);
         uint256 next = st.nextEval;
-        while (next + EVAL_LAG <= today) {
+        while (next + EVAL_LAG <= last) {
             _evaluate(next, st);
             ++next;
         }
@@ -296,12 +312,38 @@ contract DipDuckGame {
         _state = st;
     }
 
-    /// @notice Jours écoulés pas encore enregistrés (0 = à jour) : appels de `recordDay` restants
-    ///         = arrondi supérieur de daysBehind / MAX_DAYS_PER_CALL.
+    /// @notice Clôture officielle du jour `day` (USD × 1e8) si `roundId` est le dernier round publié
+    ///         avant minuit UTC de fin de ce jour ; sinon BadRound, ou DayNotFinal tant que le
+    ///         round suivant n'existe pas encore.
+    function closeOf(uint32 day, uint80 roundId) external view returns (uint64) {
+        return uint64(_closeOf(day, roundId));
+    }
+
+    function _closeOf(uint256 day, uint80 roundId) private view returns (uint256) {
+        uint256 end = DATA_START + (day + 1) * 1 days;
+        (bool ok, int256 answer, uint256 at) = _round(roundId);
+        if (!ok || at > end || answer <= 0 || uint256(answer) > MASK64) revert BadRound(uint32(day));
+        (bool found,, uint256 nextAt) = _round(roundId + 1);
+        if (!found) (found,, nextAt) = _round(uint80((((uint256(roundId) >> 64) + 1) << 64) | 1));
+        if (!found) revert DayNotFinal(uint32(day));
+        if (nextAt <= end) revert BadRound(uint32(day));
+        return uint256(answer);
+    }
+
+    /// @dev Round du flux ; `found` faux s'il n'existe pas (erreur ou updatedAt nul).
+    function _round(uint80 roundId) private view returns (bool found, int256 answer, uint256 updatedAt) {
+        try IAggregatorV3(FEED).getRoundData(roundId) returns (uint80, int256 a, uint256, uint256 u, uint80) {
+            return (u != 0, a, u);
+        } catch {
+            return (false, 0, 0);
+        }
+    }
+
+    /// @notice Jours terminés pas encore enregistrés (0 = à jour jusqu'à hier).
     function daysBehind() external view returns (uint256) {
         uint256 today = (block.timestamp - DATA_START) / 1 days;
         uint256 last = _state.lastRecorded;
-        return today > last ? today - last : 0;
+        return today > last + 1 ? today - 1 - last : 0;
     }
 
     /// @notice Dernier jour dont le prix est connu.
@@ -624,15 +666,13 @@ contract DipDuckGame {
 
     // --- Parties --------------------------------------------------------------------------------
 
-    /// @notice Enregistre les jours écoulés (un appel de `recordDay`, donc au plus
-    ///         MAX_DAYS_PER_CALL jours) puis démarre une partie pour l'appelant dans le concours
-    ///         courant (remplace la partie en cours). ContestNotReady si le retard restant laisse
-    ///         des baisses de la course non évaluées : rappeler `recordDay` d'abord.
+    /// @notice Démarre une partie pour l'appelant dans le concours courant (remplace la partie en
+    ///         cours). Ne lit aucun prix : marche même pendant une panne du flux. DataBehind si les
+    ///         prix enregistrés ne couvrent pas la course (finishDay + 15 jours, pour que toutes ses
+    ///         baisses soient évaluées) : appeler `recordDay` d'abord.
     function startRun() external {
-        recordDay();
         (uint32 id,,, uint32 finishDay) = currentContest();
-        // Toutes les baisses de la course doivent être évaluées.
-        if (uint256(finishDay) + EVAL_LAG > _state.lastRecorded) revert ContestNotReady();
+        if (uint256(finishDay) + EVAL_LAG > _state.lastRecorded) revert DataBehind();
         _runs[msg.sender] = block.timestamp | (uint256(id) << 64);
         emit RunStarted(msg.sender, id);
     }

@@ -407,19 +407,25 @@ bytecode déployé correspond toujours à celui que Blockscout recompile.
   (avant le bloc cible, après, expiration → Plain, `revealMany`, révélation au passage),
   attributs déterministes, secrets, noms (fuzzing) ; périodes de 30 jours, cagnottes et
   répartition exacte, rien avant la fin d'une période, vote par période, gagnant et report,
-  propositions (règles, quorum, approbation pour la période suivante, limite de 20).
-- `contracts/DipDuckGame.t.sol` : genèse (validation, lecture), enregistrement des prix
-  (remplissage plat, `StalePrice`), détection des baisses sur des séries construites (V net,
+  clôture et versements en mode pull (un destinataire qui refuse l'ETH ne bloque personne),
+  propositions : dépôt rendu ou confisqué, snapshot (un mint de dernière minute ne vote pas),
+  fenêtre de 7 jours, 2/3, quorum, 3 approbations par période, expiration après 6 périodes,
+  cartes de réserve du wallet communauté sans vote, limite de 20.
+- `contracts/DipDuckGame.t.sol` : genèse (validation, lecture), enregistrement des
+  clôtures officielles (jours terminés seulement, mauvais round refusé, réponse invalide,
+  changement de phase, panne du flux de 5 jours puis rattrapage, `startRun` pendant la panne,
+  rattrapage de 200 jours avec le vrai prix de chaque jour), détection des baisses sur des séries construites (V net,
   palier plat, rebond et pic aux seuils exacts, espacement, bonus), temps minimal (table
   historique, cumul jour par jour, passage d'année, plafond 690), trimestres (frontières, id,
-  `finishDay`, `ContestNotReady`), rejeu écrit à la main (parfait, bien, raté, saut et
+  `finishDay`, `ContestNotReady`, `DataBehind`), rejeu écrit à la main (parfait, bien, raté, saut et
   pièces, saut en l'air ignoré, touche en l'air jugée, pièces jamais deux fois, fin de course),
   `InvalidTaps`, `NoRun`, `RunExpired`, `TooFast`, `NotBetter`, départage complet, top 50 ;
   fuzzing : rejeu comparé à une implémentation de référence écrite d'après la règle, formule
   du temps minimal, trimestres.
 - `test/game.ts` : fichier de genèse (validation), flux de prix (code, 8 décimales),
   déploiement journalisé depuis un JSON, partie soumise, déploiement de la vraie genèse du
-  site s'il existe et gas (`recordDay`, `startRun`, `submit` d'une partie complète).
+  site s'il existe (125/125 baisses et 185/185 pièces atteignables) et gas (`recordDay` avec
+  les rounds du flux d'essai, `startRun`, `submit` d'une partie complète).
 - `test/nft.ts` : paramètres des cartes, déploiement journalisé, mint, révélation et JSON
   des métadonnées décodé.
 - `test/guards.ts` : surface des contrats (exactement les 9 fonctions ERC-20 pour le
@@ -470,14 +476,17 @@ promesse**, et rien ne va dans le pool du token. À déployer 2 à 4 semaines ap
 | Offre | 3 333 cartes, dont 111 de réserve (gratuites, frappées par le wallet communauté pour les concours) |
 | Prix | 0,001 ETH par carte, prix exact ; 10 cartes au maximum par wallet |
 | Répartition de chaque mint | 30 % fondateurs, 30 % fondation, le reste (40 %) communauté, dans les cagnottes de la **période de 30 jours** en cours |
-| Versements | **rien avant la fin d'une période** ; ensuite n'importe qui les déclenche (`withdrawFounders`, `withdrawCommunity`, `releaseCharity(période)`), toujours vers les adresses fixées au déploiement ou vers la fondation gagnante |
+| Versements (mode pull) | **rien avant la fin d'une période** ; ensuite n'importe qui la clôture (`closeRounds(max)`, dans l'ordre) : les parts sont **créditées** en soldes dus (`owed(adresse)`) aux adresses fixées au déploiement et à la fondation gagnante. Puis n'importe qui déclenche `withdraw(destinataire)`, qui n'envoie qu'à ce destinataire son dû. S'il refuse l'ETH, la transaction réussit, son solde reste crédité (`WithdrawFailed`) et personne d'autre n'est bloqué. Événements : `RoundClosed`, `Credited`, `CharityReleased`, `Withdrawn`… (traçables sur Blockscout) |
 | Vote de la fondation | à chaque période, 1 carte = 1 voix (une carte revote à chaque période) ; la cagnotte fondation de la période va au gagnant ; égalité → le plus petit index ; sans aucune voix, elle est reportée sur la période en cours |
-| Nouvelles fondations | un détenteur propose (`propose`, une par adresse et par période) ; les cartes votent pour ou contre pendant la période ; approuvée si plus de « pour » que de « contre » et au moins 10 voix, elle devient candidate à partir de la période suivante (20 candidates au maximum) |
+| Nouvelles fondations | un détenteur propose (`propose`) avec un **dépôt de 0,005 ETH**, un nom (40 octets), la description (280) et le lien `https://` (200 octets) de la **page officielle de dons qui affiche l'adresse** ; **snapshot** : seules les cartes n° 1 à `totalMinted` au moment de la proposition votent, oui ou non, une fois chacune, pendant **7 jours pleins** (indépendants des périodes) ; ensuite n'importe qui finalise : approuvée si oui ≥ 2/3 des voix exprimées **et** oui + non ≥ quorum = max(25, 5 % des cartes du snapshot, arrondi au-dessus). Approuvée : candidate dès la période suivante, dépôt rendu (crédité). Refusée : dépôt versé à la cagnotte communauté de la période en cours. **3 approbations au plus par période** et 20 fondations actives au plus : au-delà, la proposition finit « sans place » (`FULL`), dépôt rendu, et elle peut être reproposée. Une fondation approuvée qui ne gagne **aucune période pendant 6 périodes de suite** expire et libère sa place (les fondations de départ n'expirent pas). Une seule proposition ouverte par wallet de fondation ; le dépôt remplace l'ancienne limite d'une proposition par adresse et par période |
+| Cartes de réserve | tant qu'elles sont détenues par le wallet communauté, elles **ne votent pas** (ni période, ni propositions) et ce wallet ne propose pas ; données à un gagnant, elles votent normalement. Limite : le wallet communauté pourrait les transférer à une autre de ses adresses — cela se verrait sur Blockscout |
 | Métadonnées | JSON entièrement sur la chaîne (`tokenURI`), image `<imageBaseURI><numéro>.png`, page `<viewerURI>?id=<numéro>` |
 
-Pas d'owner, rien de modifiable après le déploiement.
+Pas d'owner, rien de modifiable après le déploiement. Le vote, une proposition et une
+finalisation clôturent au passage les périodes terminées (12 au plus), pour que la liste des
+fondations soit à jour ; `closeRounds` reste appelable par tous.
 
-**Règle de secours (3 périodes sans voix).** Une cagnotte sans voix est normalement reportée sur la période en cours. Mais si personne n'a voté depuis 3 périodes (`FALLBACK_AFTER`), ou jamais depuis le début en comptant la période 0, elle n'est plus reportée : elle va à la **dernière gagnante**, ou, si personne n'a jamais voté, elle est **partagée à parts égales** entre les fondations admises à cette période (le reste de la division à la première). Le site lit `charityPlan(période)` pour afficher ce qui se passera : 0 rien, 1 gagnante, 2 report, 3 dernière gagnante, 4 partage égal.
+**Règle de secours (3 périodes sans voix).** Une cagnotte sans voix est normalement reportée sur la période en cours. Mais si personne n'a voté depuis 3 périodes (`FALLBACK_AFTER`), ou jamais depuis le début en comptant la période 0, elle n'est plus reportée : elle va à la **dernière gagnante** (si elle est encore dans la liste), ou, si personne n'a jamais voté (ou si elle a expiré), elle est **partagée à parts égales** entre les fondations admises à cette période (le reste de la division à la première). Le site lit `charityPlan(période)` pour afficher ce qui se passera : 0 rien, 1 gagnante, 2 report, 3 dernière gagnante, 4 partage égal.
 
 **Le tirage (commit-reveal).** Au mint, le joueur choisit nom, humeur, élément et nombre
 porte-bonheur ; la carte note le bloc. Deux blocs plus tard (≈ 24 s), n'importe qui peut la
@@ -494,9 +503,10 @@ hasard vérifiable (Chainlink VRF) n'est déployé sur ce réseau. Pour des obje
 compromis est acceptable ; annonce-le tel quel.
 
 **Texte libre des propositions.** Le nom, le lien et la description d'une proposition ne sont
-pas filtrés par le contrat : le site doit toujours les afficher comme du **texte brut**, jamais
-comme du HTML, et vérifier lui-même qu'un lien commence par `https://` avant de le rendre
-cliquable.
+pas filtrés par le contrat (le lien doit seulement commencer par `https://`) : le site les
+affiche toujours comme du **texte brut**, montre le nom de domaine en clair avec « lien externe
+non vérifié », ne rend le lien cliquable qu'une fois la proposition approuvée, et affiche
+l'adresse bénéficiaire **complète** (contre l'empoisonnement d'adresse).
 
 **Configuration** — bloc `nft` de `launch.config.ts` : date de début du mint et de la première
 période (`mintStart`, ISO en UTC), wallet des fondateurs (vide = wallet de déploiement), 2 à 5
@@ -525,10 +535,20 @@ canard glisse sur la courbe du Bitcoin depuis 2010 et doit attraper les baisses.
 pas d'ETH, aucune fonction d'administration : **public et permanent**, personne (pas même
 toi) ne peut changer une baisse ni effacer un résultat.
 
-- **La courbe.** L'historique (baisses, bonus, temps minimaux) est figé au déploiement depuis
-  la genèse du site. Ensuite, `recordDay()` (appelable par tous, et par chaque `startRun`)
-  lit le flux Chainlink BTC/USD une fois par jour, remplit les jours manqués avec ce prix
-  (refus `StalePrice` s'il a plus de 26 h) et **détecte lui-même les nouvelles baisses** avec
+- **La courbe (prix décalé).** L'historique (baisses, bonus, temps minimaux) est figé au
+  déploiement depuis la genèse du site. Ensuite, la courbe **s'arrête à hier** :
+  `recordDay(roundIds)` (appelable par tous) n'enregistre que des jours UTC terminés, chacun à
+  sa **clôture officielle** Chainlink BTC/USD. L'appelant fournit un round par jour ; le
+  contrat vérifie avec `getRoundData` que ce round a été publié au plus tard à minuit de fin du
+  jour et que le round suivant l'a été après (même phase : `roundId + 1`, avec
+  `roundId = phaseId << 64 | numéro` ; changement d'agrégateur juste après : premier round de
+  la phase suivante, `(phaseId + 1) << 64 | 1`). Un seul round convient par jour : l'appelant
+  ne choisit rien. Tant que le round suivant n'existe pas, le jour est refusé (`DayNotFinal`) ;
+  un mauvais round ou une réponse ≤ 0 aussi (`BadRound`). Plus de remplissage à plat : après
+  une panne, chaque jour est rattrapé avec sa vraie clôture (60 jours au plus par appel,
+  `closeOf(jour, round)` pour vérifier gratuitement). Le site calcule les rounds (recherche
+  par paliers sur `getRoundData`, environ 3 lots de 16 lectures par jour). Le contrat
+  **détecte lui-même les nouvelles baisses** avec
   une règle fixe : creux du prix lissé (médiane sur 3 jours), au moins 10 % sous le pic des 30
   jours précédents, rebond d'au moins 5 % dans les 14 jours suivants, 8 jours au moins après
   la baisse précédente. `priceAt`, `pricesFrom`, `dipCount`, `dipAt` : lecture libre.
@@ -542,18 +562,26 @@ toi) ne peut changer une baisse ni effacer un résultat.
 - **Parties vérifiées.** Le joueur envoie ses touches ; le contrat **rejoue la partie** avec
   les règles entières du site (`verify(touches, finishDay)`, lisible gratuitement) : baisses
   (parfait, bien, raté), sauts de 216 pixels et pièces (une tous les 20 jours, jamais de 2 jours avant à 14 jours après une baisse, ramassées au sommet du saut, en x + 108 à 24 pixels près : toutes atteignables), 3 vies. `startRun()` note l'heure et le concours ;
+  `startRun` ne lit aucun prix (il marche pendant une panne du flux) : il exige seulement que
+  les prix couvrent la course (`finishDay + 15` enregistré), sinon `DataBehind` — le site
+  appelle alors `recordDay` d'abord (en pratique au début de chaque trimestre).
   `submit(touches, pseudo)` refuse une partie plus rapide que le vrai jeu (`TooFast`, temps
   minimal `minTimeFor` : table historique, puis cumul jour par jour calculé par la chaîne),
   plus vieille que 3 heures (`RunExpired`) ou sans départ (`NoRun`).
 - **Ce qui reste possible :** un programme qui joue vraiment, en temps réel. Le contrat
   garantit que chaque résultat correspond à une partie jouable à vitesse réelle, pas qu'un
-  humain l'a jouée. Annonce-le tel quel ; aucun prix à la clé.
+  humain l'a jouée. **Risque résiduel assumé :** la course ne contient que des jours passés,
+  donc une partie parfaite est calculable hors ligne ; la rejouer à la vitesse du jeu revient
+  exactement au cas du programme ci-dessus (pas un risque de plus). Annonce-le tel quel ; aucun
+  prix à la clé.
 
 La genèse vient du fichier partagé avec le site (`game.genesisFile` dans `launch.config.ts`,
 par défaut `../dipduck-site/seasons/genesis.json`, format `{ "detectFrom": n, "dips":
 [[jour, bonus], ...], "histMinSeconds": [...], "recentPrices": [...] }`). Le script la valide
 avec les règles du contrat et contrôle le flux (`game.feed` sur le mainnet,
-`game.testnetFeed` sur le testnet : code présent, 8 décimales) avant tout envoi.
+`game.testnetFeed` sur le testnet : code présent, 8 décimales, `getRoundData` qui répond)
+avant tout envoi. Le flux d'essai (`MockAggregator`) garde l'historique de ses rounds et
+simule les phases.
 
 ```bash
 npm run game:deploy:testnet
@@ -601,7 +629,7 @@ contracts/
   TokenVesting.t.sol     tests Solidity du blocage
   DipDuckCards.sol       cartes de collection NFT (après le lancement)
   DipDuckCards.t.sol     tests Solidity des cartes
-  DipDuckGame.sol        jeu « Attrape la baisse » : prix Chainlink, baisses, concours, rejeu
+  DipDuckGame.sol        jeu « Attrape la baisse » : clôtures Chainlink, baisses, concours, rejeu
   DipDuckGame.t.sol      tests Solidity du jeu
   mocks/MockAggregator.sol flux de prix d'essai (tests uniquement)
 scripts/

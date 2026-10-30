@@ -28,8 +28,8 @@ contract GameHarness is DipDuckGame {
     }
 }
 
-/// @notice Tests du jeu « Attrape la baisse » : genèse, enregistrement des prix (remplissage
-///         plat, prix périmé), détection des baisses sur des séries construites, temps minimal
+/// @notice Tests du jeu « Attrape la baisse » : genèse, enregistrement des clôtures officielles
+///         (rounds Chainlink vérifiés, jours terminés, pannes, phases), détection des baisses sur des séries construites, temps minimal
 ///         (historique et cumul), trimestres, rejeu (baisses, sauts, pièces), parties, départage,
 ///         top 50 ; fuzzing du rejeu contre une implémentation de référence écrite mot pour mot
 ///         d'après la spécification.
@@ -55,11 +55,47 @@ contract DipDuckGameTest {
 
     MockAggregator private feed;
     DipDuckGame private game;
+    /// @dev Round publié pour chaque jour (le dernier du jour), et dernier jour publié.
+    mapping(uint256 day => uint80) private _rid;
+    uint256 private _published;
 
     function setUp() public {
         vm.warp(_ts(H) + 3600);
-        feed = new MockAggregator(100e8);
+        _newFeed();
         game = _deploy(_baseDays(), _baseBonus(), D, _flat(100e8), 1);
+    }
+
+    /// @dev Nouveau flux : son premier round est publié maintenant ; rien n'est publié après H.
+    function _newFeed() private {
+        feed = new MockAggregator(100e8);
+        _rid[H] = feed.latestRound();
+        _published = H;
+    }
+
+    /// @dev Publie un round par jour (à 1 h UTC) jusqu'au jour `toDay`, au prix `price`.
+    function _publish(uint256 toDay, uint64 price) private {
+        for (uint256 d = _published + 1; d <= toDay; ++d) {
+            feed.setAnswer(int256(uint256(price)), _ts(d) + 3600);
+            _rid[d] = feed.latestRound();
+        }
+        if (toDay > _published) _published = toDay;
+    }
+
+    /// @dev Rounds des `n` jours qui suivent le dernier jour enregistré.
+    function _ridsFor(DipDuckGame g, uint256 n) private view returns (uint80[] memory ids) {
+        uint256 from = uint256(g.lastRecordedDay()) + 1;
+        ids = new uint80[](n);
+        for (uint256 i; i < n; ++i) ids[i] = _rid[from + i];
+    }
+
+    /// @dev Enregistre jusqu'au jour `toDay` inclus (publie les jours manquants et le lendemain).
+    function _recordTo(DipDuckGame g, uint256 toDay, uint64 price) private {
+        _publish(toDay + 1, price);
+        if (block.timestamp < _ts(toDay + 1) + 3600) vm.warp(_ts(toDay + 1) + 3600);
+        while (g.lastRecordedDay() < toDay) {
+            uint256 n = toDay - g.lastRecordedDay();
+            g.recordDay(_ridsFor(g, n > 60 ? 60 : n));
+        }
     }
 
     // --- Outils -------------------------------------------------------------------------
@@ -187,7 +223,7 @@ contract DipDuckGameTest {
         require(game.COIN_FROM() == 84 && game.COIN_TO() == 132 && game.COIN_EVERY() == 20, "pieces");
         require(game.COIN_PHASE() == 15 && game.COIN_CLEAR_BEFORE() == 2 && game.COIN_CLEAR_AFTER() == 14, "pieces (2)");
         require(game.MAX_RUN() == 3 hours && game.TOP_SIZE() == 50 && game.FINISH_LAG() == 15, "concours");
-        require(game.MAX_STALE() == 26 hours && game.MIN_TIME_BUCKET_DAYS() == 30, "temps");
+        require(game.MIN_TIME_BUCKET_DAYS() == 30, "temps");
         require(game.MAX_DAYS_PER_CALL() == 60 && game.daysBehind() == 0, "rattrapage");
         require(game.FEED() == address(feed) && game.DETECT_FROM() == D, "immuables");
     }
@@ -255,92 +291,187 @@ contract DipDuckGameTest {
 
     // --- Enregistrement des prix -------------------------------------------------------------
 
-    function test_RecordFlatFill() public {
-        vm.warp(_ts(H + 5) + 10);
-        feed.setAnswer(123e8, 0);
-        game.recordDay();
-        require(game.lastRecordedDay() == H + 5, "dernier jour");
-        for (uint32 d = H + 1; d <= H + 5; ++d) require(game.priceAt(d) == 123e8, "remplissage plat");
-        require(game.priceAt(H) == 100e8 && game.priceAt(H + 6) == 0, "bords");
+    function test_RecordOfficialCloses() public {
+        // Un round par jour (prix différents) ; le jour H + 2 a un 2e round à minuit pile.
+        for (uint256 d = H + 1; d <= H + 6; ++d) {
+            feed.setAnswer(int256((100 + d - H) * 1e8), _ts(d) + 3600);
+            _rid[d] = feed.latestRound();
+            if (d == H + 2) {
+                feed.setAnswer(222e8, _ts(d + 1)); // minuit pile : encore la clôture du jour d
+                _rid[d] = feed.latestRound();
+            }
+        }
+        _published = H + 6;
+        vm.warp(_ts(H + 6) + 7200);
+        require(game.daysBehind() == 5, "5 jours termines");
+        game.recordDay(_ridsFor(game, 5));
+        require(game.lastRecordedDay() == H + 5 && game.daysBehind() == 0, "jusqu'a hier");
+        require(game.priceAt(H + 1) == 101e8 && game.priceAt(H + 2) == 222e8 && game.priceAt(H + 5) == 105e8, "vrais prix");
+        require(game.closeOf(uint32(H + 3), _rid[H + 3]) == 103e8, "closeOf");
         uint64[] memory ps = game.pricesFrom(H - 1, 8);
-        require(ps.length == 8 && ps[0] == 100e8 && ps[1] == 100e8 && ps[2] == 123e8 && ps[6] == 123e8, "pricesFrom");
-        require(ps[7] == 0, "pricesFrom : inconnu");
-        // Même jour : le flux n'est plus lu, même périmé ou nul.
-        feed.setAnswer(0, 1);
-        game.recordDay();
-        require(game.priceAt(H + 5) == 123e8, "inchange");
-        // Jour suivant : un seul jour ajouté.
-        vm.warp(_ts(H + 6));
-        feed.setAnswer(77e8, 0);
-        game.recordDay();
-        require(game.lastRecordedDay() == H + 6 && game.priceAt(H + 6) == 77e8 && game.priceAt(H + 5) == 123e8, "+1");
+        require(ps[0] == 100e8 && ps[1] == 100e8 && ps[2] == 101e8 && ps[6] == 105e8 && ps[7] == 0, "pricesFrom");
+        // Aujourd'hui n'est jamais enregistré : la courbe s'arrête à hier.
+        uint80[] memory pending1 = _ridsFor(game, 1);
+        vm.expectRevert(_err(DipDuckGame.InvalidRounds.selector));
+        game.recordDay(pending1);
+        // Demain : le jour H + 6 est fini, mais aucun round après minuit → pas encore final.
+        vm.warp(_ts(H + 7) + 10);
+        uint80[] memory pending2 = _ridsFor(game, 1);
+        vm.expectRevert(abi.encodeWithSelector(DipDuckGame.DayNotFinal.selector, uint32(H + 6)));
+        game.recordDay(pending2);
+        feed.setAnswer(77e8, _ts(H + 7) + 5);
+        game.recordDay(_ridsFor(game, 1));
+        require(game.lastRecordedDay() == H + 6 && game.priceAt(H + 6) == 106e8, "+1");
+    }
+
+    function test_WrongRoundRejected() public {
+        _publish(H + 3, 100e8);
+        vm.warp(_ts(H + 3) + 7200);
+        bytes memory bad = abi.encodeWithSelector(DipDuckGame.BadRound.selector, uint32(H + 1));
+        uint80[] memory one = new uint80[](1);
+        one[0] = _rid[H + 2]; // publié après la fin du jour
+        vm.expectRevert(bad);
+        game.recordDay(one);
+        one[0] = _rid[H]; // pas le dernier avant minuit : le suivant est aussi avant minuit
+        vm.expectRevert(bad);
+        game.recordDay(one);
+        one[0] = 12345; // inexistant
+        vm.expectRevert(bad);
+        game.recordDay(one);
+        // Nombre de jours : au moins 1, au plus 60, jamais aujourd'hui.
+        vm.expectRevert(_err(DipDuckGame.InvalidRounds.selector));
+        game.recordDay(new uint80[](0));
+        uint80[] memory pending3 = _ridsFor(game, 3);
+        vm.expectRevert(_err(DipDuckGame.InvalidRounds.selector));
+        game.recordDay(pending3);
+        vm.warp(_ts(H + 100));
+        vm.expectRevert(_err(DipDuckGame.InvalidRounds.selector));
+        game.recordDay(new uint80[](61));
+        // Un mauvais round au milieu annule tout l'appel.
+        uint80[] memory two = _ridsFor(game, 2);
+        two[1] = _rid[H + 1];
+        vm.expectRevert(abi.encodeWithSelector(DipDuckGame.BadRound.selector, uint32(H + 2)));
+        game.recordDay(two);
+        require(game.lastRecordedDay() == H, "rien d'enregistre");
+        game.recordDay(_ridsFor(game, 2));
+        require(game.lastRecordedDay() == H + 2, "les bons rounds passent");
+    }
+
+    function test_InvalidAnswerRejected() public {
+        for (uint256 k; k < 3; ++k) {
+            _newFeed();
+            DipDuckGame g = _deploy(_baseDays(), _baseBonus(), D, _flat(100e8), 1);
+            int256 answer = k == 0 ? int256(0) : (k == 1 ? -1 : int256(uint256(type(uint64).max)) + 1);
+            feed.setAnswer(answer, _ts(H + 1) + 3600);
+            _rid[H + 1] = feed.latestRound();
+            feed.setAnswer(100e8, _ts(H + 2) + 3600);
+            vm.warp(_ts(H + 2) + 7200);
+            uint80[] memory pending4 = _ridsFor(g, 1);
+            vm.expectRevert(abi.encodeWithSelector(DipDuckGame.BadRound.selector, uint32(H + 1)));
+            g.recordDay(pending4);
+        }
+        // 2^64 − 1 : accepté.
+        _newFeed();
+        DipDuckGame ok = _deploy(_baseDays(), _baseBonus(), D, _flat(100e8), 1);
+        feed.setAnswer(int256(uint256(type(uint64).max)), _ts(H + 1) + 3600);
+        _rid[H + 1] = feed.latestRound();
+        feed.setAnswer(100e8, _ts(H + 2) + 3600);
+        ok.recordDay(_ridsFor(ok, 1));
+        require(ok.priceAt(H + 1) == type(uint64).max, "plafond 64 bits");
+    }
+
+    function test_PhaseChange() public {
+        // Le jour H + 1 se termine sur le dernier round de la phase 1 ; la phase 2 commence le jour H + 2.
+        feed.setAnswer(101e8, _ts(H + 1) + 3600);
+        uint80 lastOfPhase1 = feed.latestRound();
+        feed.newPhase(102e8, _ts(H + 2) + 3600);
+        uint80 firstOfPhase2 = feed.latestRound();
+        require(firstOfPhase2 == (uint80(2) << 64) | 1, "phase 2, round 1");
+        feed.setAnswer(103e8, _ts(H + 3) + 3600);
+        vm.warp(_ts(H + 3) + 7200);
+        uint80[] memory ids = new uint80[](2);
+        (ids[0], ids[1]) = (lastOfPhase1, firstOfPhase2);
+        game.recordDay(ids);
+        require(game.priceAt(H + 1) == 101e8 && game.priceAt(H + 2) == 102e8, "changement de phase");
     }
 
     function test_CatchUp200DaysIn4Calls() public {
-        vm.warp(_ts(H + 200) + 1);
-        feed.setAnswer(90e8, 0);
+        // 200 jours sans appel de recordDay (le flux, lui, publie chaque jour) : rattrapage avec le
+        // vrai prix de chaque jour, pas un remplissage à plat.
+        for (uint256 d = H + 1; d <= H + 201; ++d) {
+            feed.setAnswer(int256(90e8 + d), _ts(d) + 3600);
+            _rid[d] = feed.latestRound();
+        }
+        _published = H + 201;
+        vm.warp(_ts(H + 201) + 7200);
         require(game.daysBehind() == 200, "200 jours de retard");
         uint256 maxGas;
         for (uint256 k = 1; k <= 4; ++k) {
+            uint256 n = k < 4 ? 60 : 20;
+            uint80[] memory ids = _ridsFor(game, n);
             uint256 before = gasleft();
-            game.recordDay();
+            game.recordDay(ids);
             uint256 used = before - gasleft();
             if (used > maxGas) maxGas = used;
             uint256 expected = k < 4 ? 60 * k : 200;
             require(game.lastRecordedDay() == H + expected && game.daysBehind() == 200 - expected, "60 jours par appel");
         }
-        // 60 jours + 59 évaluations dans un seul appel : gas borné, très loin d'un bloc.
-        require(maxGas < 3_000_000, "appel plafonne < 3 M");
-        require(game.priceAt(H + 200) == 90e8 && game.priceAt(H + 61) == 90e8, "prix");
-        game.recordDay(); // à jour : rien
-        require(game.lastRecordedDay() == H + 200, "a jour");
-        // Le cumul du temps minimal est continu d'un appel à l'autre (prix plats : même valeur par jour).
+        // 60 jours (2 lectures du flux chacun) + 59 évaluations dans un seul appel : gas borné.
+        require(maxGas < 4_000_000, "appel plafonne < 4 M");
+        require(game.priceAt(H + 200) == 90e8 + H + 200 && game.priceAt(H + 61) == 90e8 + H + 61, "prix de chaque jour");
         require(game.minTimeFor(H + 121) >= game.minTimeFor(H + 61), "cumul continu");
     }
 
-    function test_ContestNotReadyDuringCatchUp() public {
+    function test_DataBehindDuringCatchUp() public {
         // 2027-04-06 (jour 6075), concours 5 : course jusqu'au jour 6054, prêt quand 6069 est enregistré.
-        vm.warp(_ts(6075) + 1);
-        bytes memory notReady = _err(DipDuckGame.ContestNotReady.selector);
+        _publish(6075, 100e8);
+        vm.warp(_ts(6075) + 7200);
+        bytes memory behind = _err(DipDuckGame.DataBehind.selector);
         vm.prank(ALICE);
-        vm.expectRevert(notReady); // startRun n'enregistrerait que jusqu'au jour 5973
+        vm.expectRevert(behind);
         game.startRun();
-        game.recordDay(); // 5973
+        game.recordDay(_ridsFor(game, 60)); // 5973
+        game.recordDay(_ridsFor(game, 60)); // 6033
         vm.prank(ALICE);
-        vm.expectRevert(notReady); // 6033 < 6069
+        vm.expectRevert(behind); // 6033 < 6069
         game.startRun();
-        require(game.lastRecordedDay() == 5973 && game.daysBehind() == 102, "rien garde par l'echec");
-        game.recordDay(); // 6033
+        game.recordDay(_ridsFor(game, 36)); // 6069
         vm.prank(ALICE);
-        game.startRun(); // enregistre jusqu'à 6075 : prêt
+        game.startRun(); // ne lit aucun prix
         (, uint32 contest) = game.runOf(ALICE);
-        require(contest == 5 && game.lastRecordedDay() == 6075 && game.daysBehind() == 0, "pret");
+        require(contest == 5 && game.lastRecordedDay() == 6069 && game.daysBehind() == 5, "pret");
     }
 
-    function test_StalePrice() public {
-        vm.warp(_ts(H + 1) + 7200);
-        bytes memory stale = _err(DipDuckGame.StalePrice.selector);
-        feed.setAnswer(100e8, block.timestamp - 26 hours - 1);
-        vm.expectRevert(stale);
-        game.recordDay();
-        feed.setAnswer(0, 0);
-        vm.expectRevert(stale);
-        game.recordDay();
-        feed.setAnswer(-1, 0);
-        vm.expectRevert(stale);
-        game.recordDay();
-        feed.setAnswer(int256(uint256(type(uint64).max)) + 1, 0);
-        vm.expectRevert(stale);
-        game.recordDay();
-        // startRun enregistre aussi : même refus.
-        feed.setAnswer(100e8, block.timestamp - 26 hours - 1);
+    function test_FeedOutageThenCatchUpWithRealCloses() public {
+        // Le flux publie H + 1 à H + 3, puis plus rien pendant 5 jours.
+        for (uint256 d = H + 1; d <= H + 3; ++d) {
+            feed.setAnswer(int256((100 + d - H) * 1e8), _ts(d) + 3600);
+            _rid[d] = feed.latestRound();
+        }
+        vm.warp(_ts(H + 9) + 600);
+        game.recordDay(_ridsFor(game, 2));
+        // H + 3 : aucun round après sa fin pour l'instant → refusé, rien d'inventé.
+        uint80[] memory one = new uint80[](1);
+        one[0] = _rid[H + 3];
+        vm.expectRevert(abi.encodeWithSelector(DipDuckGame.DayNotFinal.selector, uint32(H + 3)));
+        game.recordDay(one);
+        // Pendant la panne, une partie classée démarre quand même.
         vm.prank(ALICE);
-        vm.expectRevert(stale);
         game.startRun();
-        // 26 h pile : accepté.
-        feed.setAnswer(int256(uint256(type(uint64).max)), block.timestamp - 26 hours);
-        game.recordDay();
-        require(game.priceAt(H + 1) == type(uint64).max, "26 h pile");
+        (uint64 start,) = game.runOf(ALICE);
+        require(start == block.timestamp, "startRun pendant la panne");
+        // Le flux repart : chaque jour de la panne reçoit sa clôture officielle (la dernière valeur
+        // publiée avant son minuit), puis les jours suivants leurs vrais prix.
+        feed.setAnswer(150e8, _ts(H + 9) + 300);
+        uint80 resumed = feed.latestRound();
+        feed.setAnswer(160e8, _ts(H + 10) + 300);
+        vm.warp(_ts(H + 10) + 600);
+        uint80[] memory ids = new uint80[](7);
+        for (uint256 i; i < 6; ++i) ids[i] = _rid[H + 3]; // H + 3 … H + 8
+        ids[6] = resumed; // H + 9
+        game.recordDay(ids);
+        require(game.priceAt(H + 3) == 103e8 && game.priceAt(H + 8) == 103e8 && game.priceAt(H + 9) == 150e8, "clotures");
+        require(game.lastRecordedDay() == H + 9 && game.daysBehind() == 0, "a jour");
     }
 
     // --- Détection des baisses --------------------------------------------------------------
@@ -360,28 +491,23 @@ contract DipDuckGameTest {
 
     /// @dev Déploie, puis enregistre jusqu'à aujourd'hui (au moins le jour D + 40) avec le prix R.
     function _detect(uint64[] memory prices, uint16[] memory days_, uint64 rebound) private returns (DipDuckGame g) {
+        _newFeed();
         g = _deploy(days_, new uint8[](days_.length), D, prices, 1);
-        if (block.timestamp < _ts(D + 40)) vm.warp(_ts(D + 40) + 1);
-        feed.setAnswer(int256(uint256(rebound)), 0);
-        g.recordDay();
+        _recordTo(g, D + 40, rebound);
     }
 
     function test_DetectSharpV() public {
         DipDuckGame g = _deploy(new uint16[](0), new uint8[](0), D, _vShape(120e8), 1);
-        feed.setAnswer(110e8, 0);
         // c + 14 enregistré : c n'est pas encore évaluable (la médiane de c + 14 demande c + 15).
-        vm.warp(_ts(D + 19) + 1);
-        g.recordDay();
+        _recordTo(g, D + 19, 110e8);
         require(g.dipCount() == 0, "pas encore");
-        vm.warp(_ts(D + 20) + 1);
-        g.recordDay();
+        _recordTo(g, D + 20, 110e8);
         require(g.dipCount() == 1, "V detecte");
         (uint16 day, uint8 bonus) = g.dipAt(0);
         // bonus = (20 × (120 − 101) + 120) / 240 = 2.
         require(day == D + 5 && bonus == 2, "jour et bonus");
         // Rien d'autre ensuite (palier plat à 110).
-        vm.warp(_ts(D + 80) + 1);
-        g.recordDay();
+        _recordTo(g, D + 80, 110e8);
         require(g.dipCount() == 1, "palier plat ignore");
     }
 
@@ -479,10 +605,11 @@ contract DipDuckGameTest {
         uint256 price = 100e8;
         for (uint256 d = H + 1; d <= 5990; ++d) {
             price = d % 3 == 0 ? 100e8 : price * (100 - (d * 37) % 23) / 100;
-            vm.warp(_ts(d) + 60);
-            feed.setAnswer(int256(price), 0);
-            g.recordDay();
+            feed.setAnswer(int256(price), _ts(d) + 60);
+            _rid[d] = feed.latestRound();
         }
+        _published = 5990;
+        _recordTo(g, 5990, 1e8);
         uint256 sum;
         for (uint256 day = H + 1; day <= 5995; ++day) {
             require(g.minTimeFor(uint32(day)) == 2 * 197 + sum / 1e6, "cumul");
@@ -558,18 +685,26 @@ contract DipDuckGameTest {
     function test_ContestNotReadyBefore2026() public {
         // Genèse en 2025 : avant le 1er janvier 2026, pas de concours.
         vm.warp(_ts(5413) + 1);
+        feed = new MockAggregator(100e8);
+        _published = 5413;
         DipDuckGame g = _deploy(new uint16[](0), new uint8[](0), 5400, _flat(100e8), 1);
         vm.warp(1767225600 - 1); // 2025-12-31 23:59:59
-        while (g.daysBehind() > 0) g.recordDay(); // 201 jours : 4 appels
+        _recordTo(g, 5613, 100e8); // 200 jours : 4 appels
         vm.prank(ALICE);
         vm.expectRevert(_err(DipDuckGame.ContestNotReady.selector));
         g.startRun();
-        vm.warp(1767225600); // 2026-01-01 : concours 0, course jusqu'au jour 5599
+        vm.warp(1767225600); // 2026-01-01 : concours 0, course jusqu'au jour 5599, il faut le 5614
         require(g.daysBehind() == 1, "un jour de retard");
+        vm.prank(ALICE);
+        vm.expectRevert(_err(DipDuckGame.DataBehind.selector));
+        g.startRun();
+        feed.setAnswer(100e8, 1767225600 + 60); // premier round de l'année : le 31 décembre est clos
+        vm.warp(1767225600 + 120);
+        g.recordDay(_ridsFor(g, 1));
         vm.prank(ALICE);
         g.startRun();
         (, uint32 contest) = g.runOf(ALICE);
-        require(contest == 0 && g.lastRecordedDay() == 5615, "concours 0");
+        require(contest == 0 && g.lastRecordedDay() == 5614, "concours 0");
     }
 
     // --- Rejeu : scénarios écrits à la main ----------------------------------------------------
@@ -748,7 +883,11 @@ contract DipDuckGameTest {
         game.submit(_taps(1200, 1320, 2400, 3600), "a");
         (uint32 d,,,,,) = game.best(CONTEST, ALICE);
         require(d == FIN && game.topCount(CONTEST) == 1 && game.topCount(4) == 0, "concours du depart");
-        // Nouveau concours : record séparé, course plus longue (jour 5964).
+        // Nouveau concours : record séparé, course plus longue (jour 5964) ; données jusqu'au 31 décembre.
+        vm.prank(ALICE);
+        vm.expectRevert(_err(DipDuckGame.DataBehind.selector));
+        game.startRun();
+        _recordTo(game, 5979, 100e8);
         _play(game, ALICE, _taps(1200, 1320, 2400, 3600), "a");
         (d,,,,,) = game.best(4, ALICE);
         require(d == 5964 && game.topCount(4) == 1, "concours 4");

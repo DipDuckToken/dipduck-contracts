@@ -15,9 +15,10 @@ import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 ///      porte-bonheur, et paie le prix exact. Chaque mint payant crédite les
 ///      cagnottes de la période de 30 jours en cours : 30 % fondateurs, 30 %
 ///      fondation, le reste à la communauté. Rien ne sort avant la fin de la
-///      période ; ensuite, n'importe qui déclenche les versements vers des
-///      adresses fixées au déploiement (fondateurs, communauté) ou vers la
-///      fondation gagnante de la période.
+///      période ; ensuite, n'importe qui la clôture (`closeRounds`) : les parts
+///      sont CRÉDITÉES en soldes dus (`owed`), puis n'importe qui déclenche
+///      `withdraw(payee)`, qui n'envoie qu'à `payee` son dû. Un destinataire qui
+///      refuse l'ETH ne bloque personne : son solde reste crédité.
 ///
 ///      Rareté (commit-reveal) : la graine d'une carte dépend du hachage d'un
 ///      bloc FUTUR au moment du mint (`commitBlock + REVEAL_DELAY`), inconnu
@@ -37,8 +38,13 @@ import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 ///
 ///      Vote : à chaque période, 1 carte = 1 voix pour choisir la fondation qui
 ///      reçoit la cagnotte de cette période (sans voix, elle est reportée).
-///      Les détenteurs proposent de nouvelles fondations ; une proposition
-///      approuvée par vote devient candidate à partir de la période suivante.
+///      Propositions de nouvelles fondations : dépôt de 0,005 ETH (rendu si la
+///      proposition est approuvée ou faute de place, versé à la cagnotte communauté
+///      sinon), vote oui / non pendant 7 jours pleins par les seules cartes qui
+///      existaient au moment de la proposition, approbation à 2/3 des voix avec un
+///      quorum, 3 approbations au plus par période. Une fondation approuvée qui ne
+///      gagne aucune période pendant 6 périodes de suite sort de la liste.
+///      Le wallet COMMUNITY (qui détient la réserve) ne vote pas et ne propose pas.
 contract DipDuckCards is ERC721 {
     using Strings for uint256;
 
@@ -46,21 +52,33 @@ contract DipDuckCards is ERC721 {
     /// @notice Cartes gratuites pour les gagnants des concours, comptées dans MAX_SUPPLY.
     uint256 public constant RESERVED = 111;
     uint256 public constant PRICE = 0.001 ether;
-    uint256 public constant MAX_PER_WALLET = 10;
+    uint256 internal constant MAX_PER_WALLET = 10;
     /// @notice Délai entre le mint et la révélation, en blocs (`block.number`).
     uint256 public constant REVEAL_DELAY = 2;
     /// @notice Durée d'une période de vote et de cagnotte.
-    uint256 public constant ROUND_DURATION = 30 days;
-    /// @notice Voix minimales (pour + contre) pour qu'une proposition puisse être approuvée.
-    uint256 public constant PROPOSAL_QUORUM = 10;
-    uint256 public constant MAX_CANDIDATES = 20;
+    uint256 internal constant ROUND_DURATION = 30 days;
+    /// @notice Dépôt payé à `propose` : rendu si approuvée (ou faute de place), sinon à la communauté.
+    uint256 public constant PROPOSAL_DEPOSIT = 0.005 ether;
+    /// @notice Fenêtre de vote d'une proposition, à partir de sa création (indépendante des périodes).
+    uint256 internal constant VOTING_PERIOD = 7 days;
+    /// @notice Quorum (oui + non) : max(MIN_QUORUM, QUORUM_PERCENT % des cartes au snapshot, arrondi au-dessus).
+    uint256 internal constant MIN_QUORUM = 25;
+    uint256 internal constant QUORUM_PERCENT = 5;
+    /// @notice Approbations au plus par période de 30 jours (période de la finalisation).
+    uint256 internal constant MAX_APPROVALS_PER_ROUND = 3;
+    /// @notice Une fondation approuvée sans aucune victoire pendant ce nombre de périodes de suite expire.
+    uint256 internal constant CANDIDATE_EXPIRY = 6;
+    /// @notice Fondations actives au plus.
+    uint256 internal constant MAX_CANDIDATES = 20;
     /// @notice Nombre de périodes consécutives sans aucune voix avant la règle de secours.
-    uint256 public constant FALLBACK_AFTER = 3;
+    uint256 internal constant FALLBACK_AFTER = 3;
 
     uint256 private constant FOUNDERS_PERCENT = 30;
     uint256 private constant CHARITY_PERCENT = 30;
     uint256 private constant TRAIT_COUNT = 10;
     uint256 private constant MAX_NAME_LENGTH = 20;
+    /// @dev Périodes clôturées au plus au passage d'un vote, d'une proposition ou d'une finalisation.
+    uint256 private constant AUTO_CLOSE = 12;
     /// @dev Révélations faites au passage par chaque mint (cartes des autres prêtes).
     uint256 private constant AUTO_REVEALS = 3;
 
@@ -89,7 +107,8 @@ contract DipDuckCards is ERC721 {
     uint8 private constant REVEALED = 1;
     uint8 private constant PLAIN = 2;
 
-    // Statuts d'une proposition.
+    // Statuts d'une proposition. FULL : approuvée par le vote mais sans place (20 fondations
+    // actives, ou déjà 3 approbations dans la période) ; dépôt rendu, elle peut être reproposée.
     uint8 private constant OPEN = 0;
     uint8 private constant APPROVED = 1;
     uint8 private constant REJECTED = 2;
@@ -106,15 +125,20 @@ contract DipDuckCards is ERC721 {
         uint8 status;
     }
 
-    /// @dev Une fondation candidate : votable à partir de la période `fromRound`.
+    /// @dev Une fondation : votable à partir de la période `fromRound`, tant qu'elle est active.
+    ///      `since` : première période du compte des périodes sans victoire (approuvées seulement).
     struct Candidate {
         string name;
         address wallet;
         string url;
         uint64 fromRound;
+        uint64 since;
+        bool expires;
+        bool active;
     }
 
-    /// @dev Une proposition de fondation, votée pendant la période où elle est créée.
+    /// @dev Une proposition de fondation, votée pendant VOTING_PERIOD après `start` par les
+    ///      cartes 1 … `snapshot` (cartes existantes à la création).
     struct Proposal {
         string name;
         address wallet;
@@ -122,6 +146,8 @@ contract DipDuckCards is ERC721 {
         string description;
         address proposer;
         uint64 round;
+        uint64 start;
+        uint32 snapshot;
         uint32 yes;
         uint32 no;
         uint8 status;
@@ -134,7 +160,9 @@ contract DipDuckCards is ERC721 {
     string public imageBaseURI;
     string public viewerURI;
 
+    /// @dev Toutes les fondations, jamais effacées (index stable) ; `_active` : celles de la liste.
     Candidate[] private _candidates;
+    uint256[] internal _active;
     Proposal[] private _proposals;
 
     mapping(uint256 tokenId => Card) private _cards;
@@ -146,22 +174,25 @@ contract DipDuckCards is ERC721 {
     /// @dev Prochaine carte que les mints essaient de révéler au passage.
     uint256 private _nextToReveal = 1;
 
-    // Cagnottes par période de 30 jours.
+    // Cagnottes par période de 30 jours (vidées à la clôture : créditées en soldes dus).
     mapping(uint256 round => uint256) public roundCharity;
-    mapping(uint256 round => uint256) private _roundFounders;
-    mapping(uint256 round => uint256) private _roundCommunity;
-    mapping(uint256 round => bool) public roundPaid;
-    /// @dev Première période pas encore versée aux fondateurs / à la communauté.
-    uint256 private _foundersNextRound;
-    uint256 private _communityNextRound;
-    uint256 public foundersPaid;
-    uint256 public communityPaid;
+    mapping(uint256 round => uint256) public roundFounders;
+    mapping(uint256 round => uint256) public roundCommunity;
+    /// @notice Les périodes 0 … roundsClosed − 1 sont clôturées (toujours dans l'ordre).
+    uint256 public roundsClosed;
+    /// @dev Gagnante d'une période clôturée : index + 1 (0 = aucune voix).
+    mapping(uint256 round => uint256) private _winnerPlusOne;
+    mapping(uint256 round => uint256) private _approvalsIn;
+
+    // Versements en mode pull : soldes dus, retirés par `withdraw(payee)`.
+    mapping(address payee => uint256) public owed;
+    uint256 public totalOwed;
     uint256 public charityReleased;
     /// @dev Dernière période où quelqu'un a voté, et si un vote a déjà eu lieu.
     uint256 private _lastVotedRound;
     bool private _anyVote;
 
-    // Ce que `releaseCharity` ferait pour une période (voir `charityPlan`).
+    // Ce que la clôture ferait de la cagnotte fondation d'une période (voir `charityPlan`).
     uint8 private constant PLAN_NOTHING = 0;
     uint8 private constant PLAN_WINNER = 1;
     uint8 private constant PLAN_ROLLOVER = 2;
@@ -172,18 +203,22 @@ contract DipDuckCards is ERC721 {
     mapping(uint256 round => mapping(uint256 tokenId => bool)) public hasVoted;
     mapping(uint256 round => mapping(uint256 candidateIndex => uint256)) public votesFor;
     mapping(uint256 proposalId => mapping(uint256 tokenId => bool)) public hasVotedProposal;
-    mapping(address proposer => mapping(uint256 round => bool)) private _proposedIn;
     mapping(address wallet => bool) private _openProposalWallet;
 
     event Revealed(uint256 indexed tokenId, bytes32 seed);
     event Voted(address indexed voter, uint256 indexed round, uint256 indexed candidateIndex, uint256 cards);
+    event RoundClosed(uint256 indexed round, bool hasWinner, uint256 winner);
     event CharityReleased(uint256 indexed round, uint256 indexed candidateIndex, address wallet, uint256 amount);
     event CharityRolledOver(uint256 indexed fromRound, uint256 indexed toRound, uint256 amount);
     event CharityFallback(uint256 indexed round, uint8 kind, uint256 amount);
-    event Withdrawn(address indexed to, uint256 amount);
-    event Proposed(uint256 indexed id, address indexed proposer, address wallet, uint256 round);
+    event Credited(address indexed payee, uint256 indexed round, uint256 amount);
+    event Withdrawn(address indexed payee, uint256 amount);
+    event WithdrawFailed(address indexed payee, uint256 amount);
+    event Proposed(uint256 indexed id, address indexed proposer, address wallet, uint256 snapshot, uint256 endsAt);
     event ProposalVoted(uint256 indexed id, address indexed voter, bool support, uint256 cards);
     event ProposalFinalized(uint256 indexed id, uint8 status);
+    event DepositForfeited(uint256 indexed id, uint256 indexed round, uint256 amount);
+    event CandidateExpired(uint256 indexed index, uint256 round);
 
     error InvalidConfig();
     error MintNotStarted();
@@ -194,20 +229,21 @@ contract DipDuckCards is ERC721 {
     error InvalidChoice();
     error InvalidName();
     error OnlyCommunity();
+    error CommunityCannotVote();
     error NotReady(uint256 tokenId);
     error AlreadyRevealed(uint256 tokenId);
     error NotCardOwner(uint256 tokenId);
+    error NotEligible(uint256 tokenId);
     error AlreadyVoted(uint256 tokenId);
     error InvalidCandidate();
-    error RoundNotOver(uint256 round);
-    error AlreadyPaid(uint256 round);
+    error RoundsNotClosed();
     error NotHolder();
     error InvalidProposal();
     error AlreadyCandidate();
     error AlreadyProposed();
     error ProposalClosed();
+    error VotingNotOver(uint256 endsAt);
     error NothingToSend();
-    error TransferFailed();
 
     constructor(
         address founders,
@@ -231,7 +267,9 @@ contract DipDuckCards is ERC721 {
             for (uint256 j = 0; j < i; j++) {
                 if (candidateWallets[j] == candidateWallets[i]) revert InvalidConfig();
             }
-            _candidates.push(Candidate(candidateNames[i], candidateWallets[i], candidateUrls[i], 0));
+            // Fondations de départ : n'expirent jamais (la liste n'est donc jamais vide).
+            _candidates.push(Candidate(candidateNames[i], candidateWallets[i], candidateUrls[i], 0, 0, false, true));
+            _active.push(i);
         }
         FOUNDERS = founders;
         COMMUNITY = community;
@@ -254,9 +292,9 @@ contract DipDuckCards is ERC721 {
         uint256 round = currentRound();
         uint256 founders = (msg.value * FOUNDERS_PERCENT) / 100;
         uint256 charity = (msg.value * CHARITY_PERCENT) / 100;
-        _roundFounders[round] += founders;
+        roundFounders[round] += founders;
         roundCharity[round] += charity;
-        _roundCommunity[round] += msg.value - founders - charity;
+        roundCommunity[round] += msg.value - founders - charity;
 
         _autoReveal();
         _mintCards(msg.sender, quantity, name, mood, element, lucky);
@@ -459,55 +497,17 @@ contract DipDuckCards is ERC721 {
         return block.timestamp < MINT_START ? 0 : (block.timestamp - MINT_START) / ROUND_DURATION;
     }
 
-    /// @notice Fin (horodatage Unix) de la période `round`.
-    function roundEnd(uint256 round) public view returns (uint64) {
-        return uint64(MINT_START + (round + 1) * ROUND_DURATION);
-    }
-
-    /// @notice Part des fondateurs des périodes terminées, pas encore versée.
-    function foundersAvailable() public view returns (uint256 amount) {
-        uint256 current = currentRound();
-        for (uint256 r = _foundersNextRound; r < current; r++) {
-            amount += _roundFounders[r];
-        }
-    }
-
-    /// @notice Part de la communauté des périodes terminées, pas encore versée.
-    function communityAvailable() public view returns (uint256 amount) {
-        uint256 current = currentRound();
-        for (uint256 r = _communityNextRound; r < current; r++) {
-            amount += _roundCommunity[r];
-        }
-    }
-
-    /// @notice Verse aux fondateurs leur part des périodes terminées (rien avant la fin d'une période).
-    function withdrawFounders() external {
-        uint256 amount = foundersAvailable();
-        if (amount == 0) revert NothingToSend();
-        _foundersNextRound = currentRound();
-        foundersPaid += amount;
-        _send(FOUNDERS, amount);
-    }
-
-    /// @notice Verse à la communauté sa part des périodes terminées.
-    function withdrawCommunity() external {
-        uint256 amount = communityAvailable();
-        if (amount == 0) revert NothingToSend();
-        _communityNextRound = currentRound();
-        communityPaid += amount;
-        _send(COMMUNITY, amount);
-    }
-
-    /// @notice Ce que `releaseCharity(round)` ferait maintenant : 0 rien (déjà versée, cagnotte vide
-    ///         ou période pas terminée), 1 gagnante de la période (`index`), 2 report sur la période
-    ///         en cours, 3 dernière gagnante (`index`), 4 partage égal entre les candidates (`index` 0).
+    /// @notice Ce que la clôture de `round` ferait de sa cagnotte fondation : 0 rien (déjà clôturée,
+    ///         cagnotte vide ou période pas terminée), 1 gagnante de la période (`index`), 2 report sur
+    ///         la période en cours, 3 dernière gagnante (`index`), 4 partage égal entre les candidates.
+    ///         Exact pour la prochaine période à clôturer (`roundsClosed`), indicatif au-delà.
     /// @dev Règle de secours : quand la période n'a aucune voix et qu'aucune voix n'a été donnée
     ///      depuis FALLBACK_AFTER périodes (ou jamais, en comptant depuis la période 0), la
-    ///      cagnotte ne repart pas en report : elle va à la dernière gagnante, ou est partagée à
-    ///      parts égales si personne n'a jamais voté.
+    ///      cagnotte ne repart pas en report : elle va à la dernière gagnante (si elle est encore
+    ///      dans la liste), sinon elle est partagée à parts égales.
     function charityPlan(uint256 round) public view returns (uint8 kind, uint256 index) {
         uint256 current = currentRound();
-        if (round >= current || roundPaid[round] || roundCharity[round] == 0) return (PLAN_NOTHING, 0);
+        if (round >= current || round < roundsClosed || roundCharity[round] == 0) return (PLAN_NOTHING, 0);
         bool hasWinner;
         (hasWinner, index) = winnerOf(round);
         if (hasWinner) return (PLAN_WINNER, index);
@@ -520,60 +520,133 @@ contract DipDuckCards is ERC721 {
             streak = round - _lastVotedRound;
         }
         if (streak < FALLBACK_AFTER) return (PLAN_ROLLOVER, 0);
-        if (!_anyVote) return (PLAN_EQUAL_SPLIT, 0);
-        (, index) = winnerOf(_lastVotedRound);
-        return (PLAN_LAST_WINNER, index);
+        if (_anyVote) {
+            (, index) = winnerOf(_lastVotedRound);
+            if (_candidates[index].active) return (PLAN_LAST_WINNER, index);
+        }
+        return (PLAN_EQUAL_SPLIT, 0);
     }
 
-    /// @notice Après la fin de la période `round` : verse sa cagnotte fondation selon
-    ///         `charityPlan` — à la gagnante de la période, en report sur la période en cours si
-    ///         personne n'a voté, ou selon la règle de secours après FALLBACK_AFTER périodes sans voix.
-    function releaseCharity(uint256 round) external {
+    /// @notice Clôture, dans l'ordre, jusqu'à `max` périodes terminées : note la gagnante, crédite
+    ///         les soldes dus (fondateurs, communauté, fondation selon `charityPlan`) et retire les
+    ///         fondations approuvées sans victoire depuis CANDIDATE_EXPIRY périodes. N'importe qui
+    ///         peut l'appeler ; rien n'est envoyé (voir `withdraw`).
+    function closeRounds(uint256 max) external {
+        if (_closeRounds(max) == 0) revert NothingToSend();
+    }
+
+    function _closeRounds(uint256 max) private returns (uint256 done) {
         uint256 current = currentRound();
-        if (round >= current) revert RoundNotOver(round);
-        if (roundPaid[round]) revert AlreadyPaid(round);
-        uint256 amount = roundCharity[round];
-        if (amount == 0) revert NothingToSend();
-        (uint8 kind, uint256 index) = charityPlan(round);
-        roundPaid[round] = true;
-        roundCharity[round] = 0;
+        while (done < max && roundsClosed < current) {
+            _closeRound(roundsClosed, current);
+            done++;
+        }
+    }
+
+    /// @dev Vote, proposition et finalisation demandent que toutes les périodes terminées soient
+    ///      clôturées (liste des fondations à jour) : ils en clôturent jusqu'à AUTO_CLOSE au passage.
+    function _sync() private {
+        _closeRounds(AUTO_CLOSE);
+        if (roundsClosed < currentRound()) revert RoundsNotClosed();
+    }
+
+    function _closeRound(uint256 r, uint256 current) private {
+        (bool hasWinner, uint256 winner) = winnerOf(r);
+        (uint8 kind, uint256 index) = charityPlan(r);
+        if (hasWinner) _winnerPlusOne[r] = winner + 1;
+        _credit(FOUNDERS, r, roundFounders[r]);
+        _credit(COMMUNITY, r, roundCommunity[r]);
+        roundFounders[r] = 0;
+        roundCommunity[r] = 0;
+        uint256 amount = roundCharity[r];
+        roundCharity[r] = 0;
         if (kind == PLAN_ROLLOVER) {
             roundCharity[current] += amount;
-            emit CharityRolledOver(round, current, amount);
-            return;
+            emit CharityRolledOver(r, current, amount);
+        } else if (kind != PLAN_NOTHING) {
+            charityReleased += amount;
+            if (kind != PLAN_WINNER) emit CharityFallback(r, kind, amount);
+            if (kind != PLAN_EQUAL_SPLIT) {
+                _payCharity(r, index, amount);
+            } else {
+                // Partage égal entre les candidates actives admises à cette période ; le reste à la première.
+                uint256 eligible;
+                for (uint256 i = 0; i < _active.length; i++) {
+                    if (_candidates[_active[i]].fromRound <= r) eligible++;
+                }
+                uint256 share = amount / eligible;
+                uint256 remainder = amount - share * eligible;
+                for (uint256 i = 0; i < _active.length; i++) {
+                    if (_candidates[_active[i]].fromRound > r) continue;
+                    _payCharity(r, _active[i], share + remainder);
+                    remainder = 0;
+                }
+            }
         }
-        charityReleased += amount;
-        if (kind != PLAN_WINNER) emit CharityFallback(round, kind, amount);
-        if (kind != PLAN_EQUAL_SPLIT) {
-            _payCharity(round, index, amount);
-            return;
+        // Expiration : une fondation approuvée sans victoire de `since` à r inclus (6 périodes) sort.
+        for (uint256 i = _active.length; i > 0; i--) {
+            uint256 id = _active[i - 1];
+            Candidate storage c = _candidates[id];
+            if (!c.expires || c.fromRound > r) continue;
+            if (hasWinner && winner == id) {
+                c.since = uint64(r + 1);
+            } else if (r + 1 >= c.since + CANDIDATE_EXPIRY) {
+                c.active = false;
+                _active[i - 1] = _active[_active.length - 1];
+                _active.pop();
+                emit CandidateExpired(id, r);
+            }
         }
-        // Partage égal entre les candidates admises à cette période ; le reste de la division à la première.
-        uint256 eligible;
-        for (uint256 i = 0; i < _candidates.length; i++) {
-            if (_candidates[i].fromRound <= round) eligible++;
-        }
-        uint256 share = amount / eligible;
-        uint256 remainder = amount - share * eligible;
-        for (uint256 i = 0; i < _candidates.length; i++) {
-            if (_candidates[i].fromRound > round) continue;
-            _payCharity(round, i, share + remainder);
-            remainder = 0;
-        }
+        roundsClosed = r + 1;
+        emit RoundClosed(r, hasWinner, winner);
     }
 
     function _payCharity(uint256 round, uint256 index, uint256 amount) private {
         address wallet = _candidates[index].wallet;
         emit CharityReleased(round, index, wallet, amount);
-        _send(wallet, amount);
+        _credit(wallet, round, amount);
+    }
+
+    function _credit(address payee, uint256 round, uint256 amount) private {
+        if (amount == 0) return;
+        owed[payee] += amount;
+        totalOwed += amount;
+        emit Credited(payee, round, amount);
+    }
+
+    /// @notice Envoie à `payee`, et à lui seul, tout son solde dû. N'importe qui peut le déclencher.
+    ///         Si `payee` refuse l'ETH, rien n'est perdu : le solde reste crédité (WithdrawFailed),
+    ///         sans bloquer personne d'autre.
+    /// @dev Vérifications, effets (solde à 0), puis interaction ; en cas d'échec le solde est
+    ///      rajouté (+=, au cas où l'appel aurait crédité `payee` entre-temps). Une réentrance ne
+    ///      peut retirer que des soldes dus réels : pas de garde supplémentaire nécessaire.
+    function withdraw(address payee) external {
+        uint256 amount = owed[payee];
+        if (amount == 0) revert NothingToSend();
+        owed[payee] = 0;
+        totalOwed -= amount;
+        (bool ok,) = payee.call{value: amount}("");
+        if (ok) {
+            emit Withdrawn(payee, amount);
+        } else {
+            owed[payee] += amount;
+            totalOwed += amount;
+            emit WithdrawFailed(payee, amount);
+        }
     }
 
     // --- Vote de la fondation ----------------------------------------------------
 
-    /// @notice Pendant la période en cours : une voix par carte et par période pour un candidat.
+    /// @notice Pendant la période en cours : une voix par carte et par période pour une fondation
+    ///         active. Le wallet COMMUNITY (réserve) ne vote pas.
     function vote(uint256[] calldata tokenIds, uint256 candidateIndex) external {
+        if (msg.sender == COMMUNITY) revert CommunityCannotVote();
+        _sync();
         uint256 round = currentRound();
-        if (tokenIds.length == 0 || candidateIndex >= _candidates.length || _candidates[candidateIndex].fromRound > round) {
+        if (
+            tokenIds.length == 0 || candidateIndex >= _candidates.length || !_candidates[candidateIndex].active
+                || _candidates[candidateIndex].fromRound > round
+        ) {
             revert InvalidCandidate();
         }
         for (uint256 i = 0; i < tokenIds.length; i++) {
@@ -589,69 +662,100 @@ contract DipDuckCards is ERC721 {
     }
 
     /// @notice Gagnant de la période : le plus de voix, le plus petit index en cas d'égalité ;
-    ///         `hasWinner` est faux si personne n'a voté.
+    ///         `hasWinner` est faux si personne n'a voté. Noté à la clôture de la période.
     function winnerOf(uint256 round) public view returns (bool hasWinner, uint256 index) {
+        if (round < roundsClosed) {
+            uint256 w = _winnerPlusOne[round];
+            return (w != 0, w == 0 ? 0 : w - 1);
+        }
         uint256 best;
-        for (uint256 i = 0; i < _candidates.length; i++) {
-            uint256 votes = votesFor[round][i];
-            if (votes > best) {
+        for (uint256 i = 0; i < _active.length; i++) {
+            uint256 id = _active[i];
+            uint256 votes = votesFor[round][id];
+            if (votes > best || (votes == best && votes != 0 && id < index)) {
                 best = votes;
-                index = i;
+                index = id;
             }
         }
         hasWinner = best > 0;
     }
 
+    /// @notice Nombre de fondations enregistrées (actives ou expirées) : index 0 … count − 1.
     function candidateCount() external view returns (uint256) {
         return _candidates.length;
     }
 
+    /// @notice Une fondation. `deadline` : dernière période où elle doit gagner pour rester
+    ///         (0 = n'expire jamais) ; `active` faux une fois expirée.
     function candidate(uint256 i)
         external
         view
-        returns (string memory name, address wallet, string memory url, uint256 fromRound)
+        returns (string memory name, address wallet, string memory url, uint256 fromRound, bool active, uint256 deadline)
     {
         Candidate storage c = _candidates[i];
-        return (c.name, c.wallet, c.url, c.fromRound);
+        return (c.name, c.wallet, c.url, c.fromRound, c.active, c.expires ? c.since + CANDIDATE_EXPIRY - 1 : 0);
     }
 
     // --- Propositions de fondations ---------------------------------------------
-    // Le nom, le lien et la description sont du texte libre, non filtré : le site doit
-    // toujours les afficher comme du texte brut, jamais comme du HTML.
+    // Le nom, le lien et la description sont du texte libre, non filtré (le lien commence
+    // seulement par https://) : le site doit toujours les afficher comme du texte brut.
 
-    /// @notice Propose une fondation (détenteur d'au moins une carte, une proposition par
-    ///         adresse et par période). Elle se vote pendant la période en cours.
+    /// @notice Propose une fondation : détenteur d'au moins une carte, dépôt PROPOSAL_DEPOSIT exact
+    ///         (le dépôt sert de frein au spam : plus de limite par adresse), une proposition ouverte
+    ///         au plus par wallet de fondation. `url` : page officielle de dons de la
+    ///         fondation qui affiche l'adresse `wallet` (https://, 200 octets au plus).
+    ///         Votable pendant VOTING_PERIOD par les cartes déjà mintées.
     function propose(string calldata name, address wallet, string calldata url, string calldata description)
         external
+        payable
     {
+        if (msg.sender == COMMUNITY) revert CommunityCannotVote();
+        if (msg.value != PROPOSAL_DEPOSIT) revert WrongPayment(PROPOSAL_DEPOSIT);
         if (balanceOf(msg.sender) == 0) revert NotHolder();
         uint256 nameLength = bytes(name).length;
         uint256 descriptionLength = bytes(description).length;
+        bytes calldata link = bytes(url);
         if (
-            nameLength == 0 || nameLength > 40 || bytes(url).length > 120 || descriptionLength == 0
-                || descriptionLength > 280 || wallet == address(0) || wallet.code.length != 0
+            nameLength == 0 || nameLength > 40 || link.length < 9 || link.length > 200 || bytes8(link[:8]) != "https://"
+                || descriptionLength == 0 || descriptionLength > 280 || wallet == address(0) || wallet.code.length != 0
         ) {
             revert InvalidProposal();
         }
+        _sync();
         if (_openProposalWallet[wallet]) revert AlreadyProposed();
-        for (uint256 i = 0; i < _candidates.length; i++) {
-            if (_candidates[i].wallet == wallet) revert AlreadyCandidate();
+        for (uint256 i = 0; i < _active.length; i++) {
+            if (_candidates[_active[i]].wallet == wallet) revert AlreadyCandidate();
         }
         uint256 round = currentRound();
-        if (_proposedIn[msg.sender][round]) revert AlreadyProposed();
-        _proposedIn[msg.sender][round] = true;
         _openProposalWallet[wallet] = true;
-        _proposals.push(Proposal(name, wallet, url, description, msg.sender, uint64(round), 0, 0, OPEN));
-        emit Proposed(_proposals.length - 1, msg.sender, wallet, round);
+        _proposals.push(
+            Proposal(
+                name,
+                wallet,
+                url,
+                description,
+                msg.sender,
+                uint64(round),
+                uint64(block.timestamp),
+                uint32(totalMinted),
+                0,
+                0,
+                OPEN
+            )
+        );
+        emit Proposed(_proposals.length - 1, msg.sender, wallet, totalMinted, block.timestamp + VOTING_PERIOD);
     }
 
-    /// @notice Pour ou contre une proposition, pendant sa période : une voix par carte.
+    /// @notice Pour ou contre, pendant les 7 jours de la proposition : une voix par carte, seulement
+    ///         les cartes 1 … snapshot (déjà mintées à la proposition). COMMUNITY ne vote pas.
     function voteProposal(uint256 id, uint256[] calldata tokenIds, bool support) external {
+        if (msg.sender == COMMUNITY) revert CommunityCannotVote();
         Proposal storage p = _proposals[id];
-        if (p.status != OPEN || currentRound() != p.round) revert ProposalClosed();
+        if (p.status != OPEN || block.timestamp >= uint256(p.start) + VOTING_PERIOD) revert ProposalClosed();
         if (tokenIds.length == 0) revert InvalidQuantity();
         for (uint256 i = 0; i < tokenIds.length; i++) {
             uint256 tokenId = tokenIds[i];
+            if (tokenId > p.snapshot) revert NotEligible(tokenId);
             if (ownerOf(tokenId) != msg.sender) revert NotCardOwner(tokenId);
             if (hasVotedProposal[id][tokenId]) revert AlreadyVoted(tokenId);
             hasVotedProposal[id][tokenId] = true;
@@ -661,20 +765,40 @@ contract DipDuckCards is ERC721 {
         emit ProposalVoted(id, msg.sender, support, tokenIds.length);
     }
 
-    /// @notice Après la fin de sa période : approuvée si plus de « pour » que de « contre » et au
-    ///         moins PROPOSAL_QUORUM voix ; elle devient alors candidate pour la période suivante.
+    /// @notice Quorum d'une proposition : max(MIN_QUORUM, 5 % des cartes au snapshot, arrondi au-dessus).
+    function _quorumFor(uint256 snapshot) internal pure returns (uint256) {
+        uint256 q = (snapshot * QUORUM_PERCENT + 99) / 100;
+        return q < MIN_QUORUM ? MIN_QUORUM : q;
+    }
+
+    /// @notice Après les 7 jours (n'importe qui) : approuvée si oui >= 2/3 des voix exprimées et
+    ///         oui + non >= quorum. Approuvée : candidate dès la période suivante et dépôt rendu ;
+    ///         sans place (20 actives ou 3 approbations dans la période) : FULL, dépôt rendu ;
+    ///         refusée : dépôt versé à la cagnotte communauté de la période en cours.
     function finalizeProposal(uint256 id) external {
         Proposal storage p = _proposals[id];
         if (p.status != OPEN) revert ProposalClosed();
-        if (currentRound() <= p.round) revert RoundNotOver(p.round);
+        uint256 endsAt = uint256(p.start) + VOTING_PERIOD;
+        if (block.timestamp < endsAt) revert VotingNotOver(endsAt);
+        _sync();
         _openProposalWallet[p.wallet] = false;
-        if (p.yes <= p.no || uint256(p.yes) + p.no < PROPOSAL_QUORUM) {
+        uint256 round = currentRound();
+        uint256 total = uint256(p.yes) + p.no;
+        if (total < _quorumFor(p.snapshot) || uint256(p.yes) * 3 < total * 2) {
             p.status = REJECTED;
-        } else if (_candidates.length >= MAX_CANDIDATES) {
-            p.status = FULL;
+            roundCommunity[round] += PROPOSAL_DEPOSIT;
+            emit DepositForfeited(id, round, PROPOSAL_DEPOSIT);
         } else {
-            p.status = APPROVED;
-            _candidates.push(Candidate(p.name, p.wallet, p.url, p.round + 1));
+            if (_active.length >= MAX_CANDIDATES || _approvalsIn[round] >= MAX_APPROVALS_PER_ROUND) {
+                p.status = FULL;
+            } else {
+                p.status = APPROVED;
+                _approvalsIn[round]++;
+                uint256 index = _candidates.length;
+                _candidates.push(Candidate(p.name, p.wallet, p.url, uint64(round + 1), uint64(round + 1), true, true));
+                _active.push(index);
+            }
+            _credit(p.proposer, round, PROPOSAL_DEPOSIT);
         }
         emit ProposalFinalized(id, p.status);
     }
@@ -693,22 +817,17 @@ contract DipDuckCards is ERC721 {
             string memory description,
             address proposer,
             uint256 round,
-            uint256 yes,
-            uint256 no,
             uint8 status
         )
     {
         Proposal storage p = _proposals[id];
-        return (p.name, p.wallet, p.url, p.description, p.proposer, p.round, p.yes, p.no, p.status);
+        return (p.name, p.wallet, p.url, p.description, p.proposer, p.round, p.status);
     }
 
-    // --- Versements ---------------------------------------------------------------
-
-    /// @dev Appelé après la mise à jour des comptes (vérifications, effets, puis interaction).
-    function _send(address to, uint256 amount) private {
-        emit Withdrawn(to, amount);
-        (bool ok,) = to.call{value: amount}("");
-        if (!ok) revert TransferFailed();
+    /// @notice Décompte d'une proposition : voix, cartes votantes (1 … snapshot), quorum, fin du vote.
+    function proposalVotes(uint256 id) external view returns (uint256 yes, uint256 no, uint256 snapshot, uint256 quorum, uint256 endsAt) {
+        Proposal storage p = _proposals[id];
+        return (p.yes, p.no, p.snapshot, _quorumFor(p.snapshot), uint256(p.start) + VOTING_PERIOD);
     }
 
     // --- Lecture -----------------------------------------------------------------
