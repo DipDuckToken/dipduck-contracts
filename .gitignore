@@ -20,3 +20,6 @@
 # « pending » : elle renferme une transaction signée pas encore diffusée.
 # Le verrou d'exécution, lui, ne doit jamais être suivi.
 /deployments/*.lock
+
+# Sauvegardes locales (ancien historique git, etc.) : jamais publiées
+/docs/backup/
