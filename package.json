@@ -12,6 +12,7 @@
     "deploy:testnet": "hardhat run --network robinhoodTestnet --build-profile production scripts/01-deploy.ts",
     "deploy:mainnet": "hardhat run --network robinhood --build-profile production scripts/01-deploy.ts",
     "status:testnet": "hardhat run --network robinhoodTestnet scripts/04-status.ts",
+    "wallet:mainnet": "hardhat run --network robinhood scripts/10-check-wallet.ts",
     "status:mainnet": "hardhat run --network robinhood scripts/04-status.ts",
     "release:testnet": "hardhat run --network robinhoodTestnet scripts/05-release.ts",
     "release:mainnet": "hardhat run --network robinhood scripts/05-release.ts",
