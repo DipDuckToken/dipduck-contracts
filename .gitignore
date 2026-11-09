@@ -21,8 +21,8 @@
 # Le verrou d'exécution, lui, ne doit jamais être suivi.
 /deployments/*.lock
 
-# Sauvegardes locales (ancien historique git, etc.) : jamais publiées
-/docs/backup/
+# Documents internes (guide, plans, sauvegardes) : jamais publiés
+/docs/
 
 # Copie locale du journal avant correction manuelle (9 nov. 2026)
 /deployments/*.before-fix.json

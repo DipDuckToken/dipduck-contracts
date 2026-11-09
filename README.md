@@ -111,8 +111,6 @@ npm run rehearsal    # full launch on a local fork of the mainnet (nothing is se
 Compiler: solc 0.8.34, optimizer 200 runs, EVM `cancun`. Dependencies: OpenZeppelin
 Contracts 5.6.1, Uniswap v3.
 
-The detailed launch guide (in French) is in [`docs/GUIDE-LANCEMENT.md`](docs/GUIDE-LANCEMENT.md).
-
 ## Security
 
 There has been no paid external audit. The code is short, immutable and tested; please
