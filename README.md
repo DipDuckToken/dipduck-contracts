@@ -116,8 +116,8 @@ Contracts 5.6.1, Uniswap v3.
 There has been no paid external audit. The code is short, immutable, built on OpenZeppelin
 and fully tested.
 
-**Found a bug?** Please report it privately via [x.com/DipDuckToken](https://x.com/DipDuckToken)
-(DMs open for security reports only) — do not post it publicly first. Serious, valid findings
+**Found a bug?** Please report it privately to **security@dipduck.xyz** — do not post it
+publicly first. Serious, valid findings
 will be rewarded from the community reserve; the amount is decided case by case by the
 2-of-3 community Safe, depending on severity.
 
